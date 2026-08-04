@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Portalk Memory MCP Server
+Tideline Memory MCP Server
 
 MCP-A (memory_*): Structured memory — narratives, profiles, snapshots
 MCP-B (context_*): Full context timeline + semantic search
 
 Environment variables:
   MEMORY_MCP_DB       SQLite path (default: ~/memory/mcp_memory.db)
-  EMBEDDING_API_KEY   Embedding API key (optional — enables semantic search)
-  EMBEDDING_API_URL   Embedding endpoint (default: Zhipu)
+  EMBEDDING_API_URL   Embedding endpoint. Two modes:
+                      - Local: http://localhost:PORT/embed_batch (bge-m3, default)
+                      - Remote: any OpenAI-compatible embedding API
+  EMBEDDING_API_KEY   API key (required for remote providers; ignored for local)
   EMBEDDING_MODEL     Model name (default: embedding-3)
   AGENT_NAME          Agent label for logs (default: "agent")
+
+If no embedding service is configured or reachable, the server gracefully
+degrades to keyword-only (FTS5) search. Semantic search silently skips.
 """
 
 import os, sys, json, math, sqlite3
@@ -32,6 +37,8 @@ def _now():
 def _db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
 
 def _init():
@@ -193,19 +200,43 @@ def _normalize_weights(c, window=20):
         c.execute("UPDATE narratives SET weight = ? WHERE id = ?", (new_w, r["id"]))
 
 # ─── Embedding ───────────────────────────────────────────
-LOCAL_EMB_URL = "http://localhost:18001/embed_batch"
+# Supports local bge-m3 service OR remote OpenAI-compatible API.
+# Configured via environment variables. Gracefully degrades to keyword-only.
+EMB_URL = os.environ.get("EMBEDDING_API_URL", "http://localhost:18001/embed_batch")
+EMB_KEY = os.environ.get("EMBEDDING_API_KEY", "")
+EMB_MODEL = os.environ.get("EMBEDDING_MODEL", "embedding-3")
+
+def _is_local_emb():
+    """Check if embedding endpoint is local (no API key needed)."""
+    return "localhost" in EMB_URL or "127.0.0.1" in EMB_URL
 
 async def _embed(text: str):
-    """Return embedding vector via local bge-m3 service (1024-dim)."""
+    """Return embedding vector. Supports local bge-m3 or remote API."""
+    if not text or not text.strip():
+        return None
     try:
         import httpx
+        headers = {}
+        if not _is_local_emb():
+            headers["Authorization"] = f"Bearer {EMB_KEY}"
         async with httpx.AsyncClient(trust_env=False, timeout=30) as cli:
-            r = await cli.post(
-                LOCAL_EMB_URL,
-                json={"texts": [text[:5000]]},
-            )
+            if _is_local_emb():
+                # Local bge-m3: POST /embed_batch {"texts": [...]}
+                r = await cli.post(EMB_URL, json={"texts": [text[:5000]]})
+            else:
+                # Remote: OpenAI-compatible POST /embeddings
+                r = await cli.post(
+                    EMB_URL,
+                    json={"input": text[:5000], "model": EMB_MODEL},
+                    headers=headers,
+                )
             r.raise_for_status()
-            return r.json()["embeddings"][0]
+            data = r.json()
+            if "embeddings" in data:
+                return data["embeddings"][0]
+            if "data" in data:
+                return data["data"][0]["embedding"]
+            return None
     except Exception as e:
         print(f"[memory-mcp] embed error: {e}", file=sys.stderr)
         return None
@@ -290,7 +321,7 @@ def _fmt_profile(r):
     return f"[{r['ptype']}] {r['entity']}:\n{r['content']}"
 
 # ─── MCP Server ──────────────────────────────────────────
-app = Server("portalk-memory")
+app = Server("tideline-memory")
 
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
@@ -783,11 +814,16 @@ async def _dispatch(name, a, c):
         # 3. Semantic search (supplements keyword matches)
         emb = await _embed(query)
         if emb:
-            for r in c.execute("SELECT * FROM narratives WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 500").fetchall():
+            # Narratives: scan all (table is small, typically <1000 rows)
+            for r in c.execute("SELECT * FROM narratives WHERE embedding IS NOT NULL").fetchall():
                 score = _cosine(emb, json.loads(r["embedding"]))
                 if score > 0.3:
                     results.append((score, "🧠记忆", _fmt_narrative(r), 0))
-            ctx_rows = c.execute("SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 2000").fetchall()
+            # Context: scan most recent 5000 rows (protects against full-table
+            # scan at scale; increase LIMIT or add sqlite-vec for >10k rows)
+            ctx_rows = c.execute(
+                "SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 5000"
+            ).fetchall()
             scored = []
             for r in ctx_rows:
                 scored.append((_cosine(emb, json.loads(r["embedding"])), r))
@@ -837,7 +873,7 @@ async def _dispatch(name, a, c):
         sem_scored = []
         if emb:
             ctx_rows = c.execute(
-                "SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 2000"
+                "SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 5000"
             ).fetchall()
             for r in ctx_rows:
                 sem_scored.append((_cosine(emb, json.loads(r["embedding"])), r))
@@ -881,7 +917,8 @@ async def _dispatch(name, a, c):
 # ─── Entrypoint ──────────────────────────────────────────
 async def main():
     _init()
-    print(f"[memory-mcp] starting | db={DB_PATH} | embedding=local-bge-m3 | agent={AGENT}", file=sys.stderr)
+    emb_mode = "local-bge-m3" if _is_local_emb() else f"remote({EMB_MODEL})"
+    print(f"[memory-mcp] starting | db={DB_PATH} | embedding={emb_mode} | agent={AGENT}", file=sys.stderr)
     async with stdio_server() as (read, write):
         await app.run(read, write, app.create_initialization_options())
 
