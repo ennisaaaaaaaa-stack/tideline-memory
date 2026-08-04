@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bulk import Hermes sessions into Portalk Memory MCP.
+Bulk import Hermes sessions into Tideline Memory MCP.
 
 Scans all session files, extracts user/assistant dialogue,
 groups by ISO week + platform, writes to MCP-B context table with embeddings.
@@ -11,9 +11,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
 
-DB_PATH = "/home/ubuntu/memory/mcp_memory.db"
-SESSIONS_DIR = os.path.expanduser("~/.hermes/sessions")
-EMB_URL = "http://localhost:18001/embed_batch"
+DB_PATH = os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db"))
+SESSIONS_DIR = os.path.expanduser(os.environ.get("HERMES_SESSIONS_DIR", "~/.hermes/sessions"))
+EMB_URL = os.environ.get("EMBEDDING_API_URL", "http://localhost:18001/embed_batch")
 
 def now_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -187,6 +187,9 @@ def create_weekly_summary(sessions_in_week):
 
 def main():
     c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
     
     # Scan all sessions
     print("Scanning sessions...")
