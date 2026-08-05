@@ -109,8 +109,9 @@ Each narrative memory is scored on four dimensions (1-5), combined into a normal
 
 ### DREAM system
 
-The DREAM layer runs on a daily cron and has three progressive layers:
+The DREAM layer runs on a daily cron. Layer 0 (solidification) runs first, then three progressive layers:
 
+0. **Solidification** (固化) — Scan the day's unindexed context, decide what's worth keeping, write new narrative memories with `source_links` back to raw context. The entry point — before this runs, the day's conversations exist only as raw context, not yet memory.
 1. **Combing** (梳理) — Weight re-evaluation, profile/self-concept updates, conflict detection, thread generation. Structured, rational.
 2. **Night drift** (夜游) — Pick one high-weight memory, drift via embeddings/related_entities/topic_clusters to unrelated territory. Ask: is there an invisible connection? No pressure to produce.
 3. **Symbolic dream** (象征梦) — Extract 3-5 symbols from today's memories, weave them into a dream-like story, write a self_reflection from it. Dream weight: importance fixed at 1 (won't pollute real memory), but emotional/recurrence/unresolved scored normally. Dreams feedback into next day's combing.
@@ -204,7 +205,7 @@ At ~250 memories, Jaccard co-occurrence merging creates cascading mega-clusters 
 
 ## License
 
-PolyForm Noncommercial License 1.0.0 — use it, fork it, learn from it, build with it. Just don't sell it.
+MIT License — free to use, modify, distribute, and commercialize. See [LICENSE](LICENSE) for details.
 
 ## Origins
 
