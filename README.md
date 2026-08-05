@@ -55,11 +55,12 @@ Agent memory isn't a storage problem — it's a retrieval problem. Most of the t
                      ▼
               INJECT (into context)
                      │
-    T0: identity anchor (SOUL.md + self_concept)
-    T1: session bridge (recent context)
+    T0: identity anchor (SOUL.md + self_concept + snapshot)
+    T1: session bridge (recent context + semantic retrieval)
     T2: prefetch cache (high-weight + topic-relevant)
-    T3: memory map (cluster index + profiles)
-    T4: active retrieval (embedding + FTS5, fallback)
+    ─────────────────────────────
+    T3: memory map (cluster index + profiles)     ← roadmap
+    T4: active retrieval (embedding + FTS5)       ← roadmap
 ```
 
 ### Layer 0 — Solidification (固化)
@@ -205,7 +206,7 @@ At ~250 memories, Jaccard co-occurrence merging creates cascading mega-clusters 
 
 ## License
 
-MIT License — free to use, modify, distribute, and commercialize. See [LICENSE](LICENSE) for details.
+PolyForm Noncommercial License 1.0.0 — use it, fork it, learn from it, build with it. Just don't sell it. See [LICENSE](LICENSE) for full terms.
 
 ## Origins
 
