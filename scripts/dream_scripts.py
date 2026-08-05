@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Portalk Memory v2.3 — Script Layer (deterministic, no LLM, no token cost)
+Tideline Memory v2.3 — Script Layer (deterministic, no LLM, no token cost)
 
 Three jobs:
 1. jieba noun-frequency → TF-IDF filtering → co-occurrence clustering → topic_clusters table
@@ -20,6 +20,8 @@ import os, sys, json, sqlite3, re, math
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
+import jieba
+import jieba.posseg as pseg
 
 DB_PATH = os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db"))
 
@@ -47,13 +49,12 @@ def _normalize_weights(c, window=20):
         new_w = max(0.0, min(1.0, r["weight"] * scale))
         c.execute("UPDATE narratives SET weight = ? WHERE id = ?", (new_w, r["id"]))
 
-import jieba
-import jieba.posseg as pseg
-
 # ─── Helpers ─────────────────────────────────────────────
 def _db():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
 
 def _now():
@@ -99,7 +100,7 @@ NOUN_TAGS = {'n', 'nr', 'ns', 'nt', 'nz', 'vn', 'ng'}
 DOMAIN_STOPWORDS = frozenset("""
 用户 核心 东西 问题 模式 结构 框架 方式 方向 信号 分析 关系 空间 状态 数据
 内容 机制 体验 结论 实验 设计 信息 区分 关键 时候 时间 对话 系统 工具
-记录 反应 模型 架构 质感 概念 角度 层面 意义 价值 部分整体 觉察 观察
+记录 反应 模型 架构 质感 概念 角度 层面 意义 价值 部分 整体 觉察 观察
 发现 思考 理解 认识 本质 根源 逻辑 能力 可能 现实 目标 结果 过程 细节
 感受 情绪 感觉 意识 变化 区别 特征 类型 阶段 起点 终点 路径 方法 理论
 原因 理由 事实 理想 实际 行为 动机 驱动 内在 外在 自我 对象 范畴 规律
