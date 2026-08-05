@@ -221,6 +221,38 @@ python3 import_sessions.py
 
 这会把 Hermes 的 session 文件按周聚合写入 context 表。其他框架的对话记录需要自行适配提取逻辑。
 
+### MCP 客户端兼容性
+
+Tideline 是标准 MCP server，任何支持 MCP 的客户端都能接入。不同客户端的差异在于：**是否支持主动注入**（即 provider 插件层），以及**接入方式**。
+
+#### Tier 1 — 完整支持（持久身份 + 工具层，LLM 主动使用记忆工具）
+
+| 客户端 | 传输方式 | 配置方式 | 备注 |
+|--------|----------|----------|------|
+| **Claude Desktop** | stdio | JSON 配置文件 | Windows 下需要 `cmd /c` wrapper |
+| **Claude Code** | stdio | `claude mcp add` 一行命令 | |
+| **Hermes** | stdio + provider 插件层 | `hermes mcp` + plugin | **唯一能做主动注入（T0-T4 全层）的运行时** |
+| **Cursor** | stdio | settings UI | |
+| **Codex CLI** | stdio | `~/.codex/` 配置 | |
+| **Cline** | stdio | VS Code 扩展 | |
+| **Windsurf** | stdio | | |
+| **OpenClaw** | stdio + SSE + Streamable HTTP | CLI 和 GUI 配置 | 自带 migrate-hermes 和 active-memory 扩展 |
+
+#### Tier 2 — 可用但需要引导
+
+| 客户端 | 状态 |
+|--------|------|
+| **VS Code Copilot** | MCP 支持仍在灰度推出，尚未成熟 |
+| 各种 MCP CLI host 工具 | 基本可用，功能取决于具体实现 |
+
+#### 不支持（仅远程传输）
+
+| 客户端 | 原因 |
+|--------|------|
+| **Claude.ai 网页版 / ChatGPT 网页版** | 仅支持远程传输（Streamable HTTP），不支持 stdio。需要 Tideline 额外提供 HTTP endpoint 才能接入。 |
+
+> **关于主动注入**：上述所有 Tier 1 客户端都能让 LLM 通过 MCP 工具主动读写记忆。但 **T0-T4 的自动注入**（每轮对话前自动把记忆注入 context）需要运行时暴露 provider 插件 hook——目前只有 Hermes Agent 的插件层支持。其他客户端需要靠 LLM 自己在对话中主动调用 `memory_search` / `memory_recall` 来检索记忆，效果取决于底模的记忆意识（见上方"底模差异"一节）。
+
 ---
 
 ## 数据备份
