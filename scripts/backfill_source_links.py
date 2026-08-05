@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Backfill source_links for existing narratives.
 
@@ -33,8 +34,10 @@ def parse_ts(ts):
         return None
 
 def backfill():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
 
     # Get all narratives with empty source_links
     empty = c.execute(
