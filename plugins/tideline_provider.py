@@ -30,6 +30,11 @@ import os as _os
 
 _DB_PATH = _os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db"))
 _EMBED_URL = _os.environ.get("EMBEDDING_API_URL", "http://127.0.0.1:18001/embed_batch")
+_EMBED_KEY = _os.environ.get("EMBEDDING_API_KEY", "")
+_EMBED_MODEL = _os.environ.get("EMBEDDING_MODEL", "embedding-3")
+
+def _is_local_emb() -> bool:
+    return "localhost" in _EMBED_URL or "127.0.0.1" in _EMBED_URL
 
 # ─── Helpers ──────────────────────────────────────────────
 
@@ -53,19 +58,39 @@ def _cosine(a: list, b: list) -> float:
     return dot / (na * nb)
 
 def _embed(text: str) -> list:
-    """Get embedding from local bge-m3 embedding server."""
+    """Get embedding from local bge-m3 or remote OpenAI-compatible API."""
     import urllib.request, json
     try:
-        req = urllib.request.Request(
-            _EMBED_URL,
-            data=json.dumps({"texts": [text]}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            embeddings = data.get("embeddings", [])
-            return embeddings[0] if embeddings else []
+        if _is_local_emb():
+            # Local bge-m3: POST {"texts": [...]} → {"embeddings": [[...]]}
+            req = urllib.request.Request(
+                _EMBED_URL,
+                data=json.dumps({"texts": [text]}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                embeddings = data.get("embeddings", [])
+                return embeddings[0] if embeddings else []
+        else:
+            # Remote OpenAI-compatible: POST {"model":..., "input":...} with Bearer
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {_EMB_KEY}",
+            }
+            req = urllib.request.Request(
+                _EMBED_URL,
+                data=json.dumps({"model": _EMB_MODEL, "input": text}).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                if "data" in data:
+                    return data["data"][0].get("embedding", [])
+                embeddings = data.get("embeddings", [])
+                return embeddings[0] if embeddings else []
     except Exception as e:
         logger.debug("embed failed: %s", e)
         return []
