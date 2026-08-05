@@ -1,32 +1,21 @@
-"""Tideline Memory Provider — auto-injects from the Tideline MCP DB.
+"""Tideline Memory Provider — auto-injects from MCP DB.
 
-Reads the same SQLite DB as the MCP server (MEMORY_MCP_DB).  Only does
-auto-injection (system_prompt_block + prefetch).  Interactive tools stay in
-the MCP server — this provider exposes NO tools, avoiding conflicts.
-
-This is the proactive-injection layer for runtimes that support a provider
-plugin hook (e.g. Hermes Agent).  MCP-only clients get the same data through
-the MCP tools, but without automatic injection.
+Reads the same SQLite DB as the MCP server (configured via MEMORY_MCP_DB env var).
+Only does auto-injection (system_prompt_block + prefetch). Interactive tools
+stayed in MCP server — this provider exposes NO tools, avoiding conflicts.
 
 Layers:
-  T0 (system_prompt_block): self_concept + latest snapshot + open threads
-                            + prefetch pool  — identity anchor
-  T1 (prefetch):            semantic search over the 100 most recent
-                            narratives (embedding cosine > 0.25)
-  T2 (system_prompt_block): high-weight prefetch pool (weight>0.6,
-                            last 7 days, top 5)
-  T3 (system_prompt_block): memory map — top 25 topic clusters +
-                            all entity profiles
-  T4 (prefetch fallback):   full-corpus FTS5 keyword search when T1
-                            returns <2 results
-  sync_turn:        write user+assistant turn to the context table
-  on_pre_compress:  rescue high-weight memories before context compression
+  T0 (system_prompt_block): self_concept + latest snapshot + open threads + prefetch pool
+  T1 (prefetch): semantic search narratives matching the conversation
+  T3 (system_prompt_block): topic cluster map + entity profiles
+  T4 (prefetch fallback): full-corpus FTS5 search when T1 returns <2 results
+  sync_turn: write user+assistant turn to context table
+  on_pre_compress: rescue high-weight memories before context compression
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 import threading
 import time
@@ -37,12 +26,8 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
-_DB_PATH = os.environ.get(
-    "MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db")
-)
-_EMBED_URL = os.environ.get(
-    "EMBEDDING_API_URL", "http://127.0.0.1:18001/embed_batch"
-)
+_DB_PATH = str(Path.home() / "memory" / "mcp_memory.db")
+_EMBED_URL = "http://127.0.0.1:18001/embed_batch"
 
 # ─── Helpers ──────────────────────────────────────────────
 
@@ -51,8 +36,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(_DB_PATH, timeout=3)
+    c = sqlite3.connect(_DB_PATH, timeout=5)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
 
 def _cosine(a: list, b: list) -> float:
@@ -64,7 +51,7 @@ def _cosine(a: list, b: list) -> float:
     return dot / (na * nb)
 
 def _embed(text: str) -> list:
-    """Get embedding from a local bge-m3 embedding server."""
+    """Get embedding from local bge-m3 embedding server."""
     import urllib.request, json
     try:
         req = urllib.request.Request(
@@ -84,7 +71,7 @@ def _embed(text: str) -> list:
 # ─── Provider ─────────────────────────────────────────────
 
 class TidelineMemoryProvider(MemoryProvider):
-    """Read-only auto-injection from the Tideline MCP memory DB."""
+    """Read-only auto-injection from Portalk MCP memory DB."""
 
     def __init__(self):
         self._db_path = _DB_PATH
@@ -102,10 +89,10 @@ class TidelineMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._turn_count = 0
-        logger.info("Tideline memory provider initialized (session=%s, db=%s)",
+        logger.info("Portalk memory provider initialized (session=%s, db=%s)",
                      session_id, self._db_path)
 
-    # ═══ T0 + T2 + T3: System Prompt Block ════════════════
+    # ═══ T0: System Prompt Block ═══════════════════════════
 
     def system_prompt_block(self) -> str:
         """Inject at session start: who I am, what state I'm in, what threads are open."""
@@ -141,7 +128,7 @@ class TidelineMemoryProvider(MemoryProvider):
                     lines.append(f"- {t['content']}{w}")
                 parts.append("\n".join(lines))
 
-            # 4. T2 — Prefetch pool (high-weight recent memories)
+            # 4. Prefetch pool (high-weight recent memories)
             pool = c.execute(
                 """SELECT gesture, cognition_direction, weight FROM narratives
                    WHERE weight > 0.6
@@ -188,7 +175,7 @@ class TidelineMemoryProvider(MemoryProvider):
             return "\n\n".join(parts)
 
         except Exception as e:
-            logger.warning("Tideline system_prompt_block failed: %s", e)
+            logger.warning("Portalk system_prompt_block failed: %s", e)
             return ""
 
     # ═══ T1: Prefetch (per-turn semantic search) ══════════
@@ -238,7 +225,6 @@ class TidelineMemoryProvider(MemoryProvider):
             if len(top) < 2:
                 t4_results = self._t4_fts_search(c, query, c_ids=[r["id"] for _, r in top])
                 if t4_results:
-                    t4_lines = [top_lines for top_lines in [t4_results]]
                     lines = ["## 相关记忆（auto-recalled）\n"]
                     for sim, r in top:
                         cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
@@ -267,7 +253,7 @@ class TidelineMemoryProvider(MemoryProvider):
             return result
 
         except Exception as e:
-            logger.warning("Tideline prefetch failed: %s", e)
+            logger.warning("Portalk prefetch failed: %s", e)
             return ""
 
     def _t4_fts_search(self, c, query: str, c_ids: list) -> str:
@@ -333,22 +319,22 @@ class TidelineMemoryProvider(MemoryProvider):
     # ═══ sync_turn (write context) ════════════════════════
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Write turn to context table (same as MCP server does)."""
+        """Write turn to context table with embedding (same as MCP server does)."""
         self._turn_count += 1
         try:
             c = _db()
-            c.execute(
-                "INSERT INTO context (content, created_at) VALUES (?, ?)",
-                (f"[USER] {user_content[:2000]}", _now()),
-            )
-            c.execute(
-                "INSERT INTO context (content, created_at) VALUES (?, ?)",
-                (f"[ASSISTANT] {assistant_content[:2000]}", _now()),
-            )
+            for role, text in [("USER", user_content), ("ASSISTANT", assistant_content)]:
+                content = f"[{role}] {text[:2000]}"
+                emb = _embed(content[:500])
+                emb_json = json.dumps(emb) if emb else None
+                c.execute(
+                    "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
+                    (content, emb_json, _now()),
+                )
             c.commit()
             c.close()
         except Exception as e:
-            logger.debug("Tideline sync_turn failed: %s", e)
+            logger.debug("Portalk sync_turn failed: %s", e)
 
     # ═══ on_pre_compress (rescue) ═════════════════════════
 
@@ -366,14 +352,14 @@ class TidelineMemoryProvider(MemoryProvider):
             if not rows:
                 return ""
 
-            lines = ["[Tideline memory rescue] 高权重记忆不可遗忘：\n"]
+            lines = ["[Portalk memory rescue] 高权重记忆不可遗忘：\n"]
             for r in rows:
                 cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
                 lines.append(f"- {r['gesture']}{cd}")
             return "\n".join(lines)
 
         except Exception as e:
-            logger.debug("Tideline on_pre_compress failed: %s", e)
+            logger.debug("Portalk on_pre_compress failed: %s", e)
             return ""
 
     # ═══ No tools (MCP server handles interactive) ════════
@@ -383,4 +369,4 @@ class TidelineMemoryProvider(MemoryProvider):
         return []
 
     def shutdown(self) -> None:
-        logger.info("Tideline memory provider shutdown")
+        logger.info("Portalk memory provider shutdown")
