@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Portalk Memory MCP Server
+Tideline Memory MCP Server
 
 MCP-A (memory_*): Structured memory — narratives, profiles, snapshots
 MCP-B (context_*): Full context timeline + semantic search
@@ -30,8 +30,10 @@ def _now():
 
 # ─── Database ────────────────────────────────────────────
 def _db():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
 
 def _init():
@@ -213,19 +215,39 @@ def _normalize_weights(c, window=20):
         c.execute("UPDATE narratives SET weight = ? WHERE id = ?", (new_w, r["id"]))
 
 # ─── Embedding ───────────────────────────────────────────
-LOCAL_EMB_URL = "http://localhost:18001/embed_batch"
+import os as _os
+
+_EMB_URL = _os.environ.get("EMBEDDING_API_URL", "http://localhost:18001/embed_batch")
+_EMB_KEY = _os.environ.get("EMBEDDING_API_KEY", "")
+_EMB_MODEL = _os.environ.get("EMBEDDING_MODEL", "embedding-3")
+
+def _is_local_emb() -> bool:
+    """True if embedding service is on localhost (no API key needed)."""
+    return "localhost" in _EMB_URL or "127.0.0.1" in _EMB_URL
 
 async def _embed(text: str):
-    """Return embedding vector via local bge-m3 service (1024-dim)."""
+    """Return embedding vector via local bge-m3 or remote OpenAI-compatible API."""
     try:
         import httpx
-        async with httpx.AsyncClient(trust_env=False, timeout=30) as cli:
-            r = await cli.post(
-                LOCAL_EMB_URL,
-                json={"texts": [text[:5000]]},
-            )
-            r.raise_for_status()
-            return r.json()["embeddings"][0]
+        headers = {}
+        payload_key = "texts"
+        payload = {payload_key: [text[:5000]]}
+
+        if _is_local_emb():
+            # Local bge-m3: POST {"texts": [...]} → {"embeddings": [[...]]}
+            async with httpx.AsyncClient(trust_env=False, timeout=30) as cli:
+                r = await cli.post(_EMB_URL, json=payload)
+                r.raise_for_status()
+                return r.json()["embeddings"][0]
+        else:
+            # Remote OpenAI-compatible: POST {"model":..., "input":...} with Bearer
+            headers["Authorization"] = f"Bearer {_EMB_KEY}"
+            payload = {"model": _EMB_MODEL, "input": text[:5000]}
+            async with httpx.AsyncClient(trust_env=False, timeout=30) as cli:
+                r = await cli.post(_EMB_URL, json=payload, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+                return data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
     except Exception as e:
         print(f"[memory-mcp] embed error: {e}", file=sys.stderr)
         return None
@@ -310,7 +332,7 @@ def _fmt_profile(r):
     return f"[{r['ptype']}] {r['entity']}:\n{r['content']}"
 
 # ─── MCP Server ──────────────────────────────────────────
-app = Server("portalk-memory")
+app = Server("tideline-memory")
 
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
@@ -803,11 +825,11 @@ async def _dispatch(name, a, c):
         # 3. Semantic search (supplements keyword matches)
         emb = await _embed(query)
         if emb:
-            for r in c.execute("SELECT * FROM narratives WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 500").fetchall():
+            for r in c.execute("SELECT * FROM narratives WHERE embedding IS NOT NULL ORDER BY created_at DESC").fetchall():
                 score = _cosine(emb, json.loads(r["embedding"]))
                 if score > 0.3:
                     results.append((score, "🧠记忆", _fmt_narrative(r), 0))
-            ctx_rows = c.execute("SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 2000").fetchall()
+            ctx_rows = c.execute("SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 5000").fetchall()
             scored = []
             for r in ctx_rows:
                 scored.append((_cosine(emb, json.loads(r["embedding"])), r))
@@ -857,7 +879,7 @@ async def _dispatch(name, a, c):
         sem_scored = []
         if emb:
             ctx_rows = c.execute(
-                "SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 2000"
+                "SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 5000"
             ).fetchall()
             for r in ctx_rows:
                 sem_scored.append((_cosine(emb, json.loads(r["embedding"])), r))

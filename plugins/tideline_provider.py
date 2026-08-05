@@ -26,8 +26,10 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
-_DB_PATH = str(Path.home() / "memory" / "mcp_memory.db")
-_EMBED_URL = "http://127.0.0.1:18001/embed_batch"
+import os as _os
+
+_DB_PATH = _os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db"))
+_EMBED_URL = _os.environ.get("EMBEDDING_API_URL", "http://127.0.0.1:18001/embed_batch")
 
 # ─── Helpers ──────────────────────────────────────────────
 
@@ -71,7 +73,7 @@ def _embed(text: str) -> list:
 # ─── Provider ─────────────────────────────────────────────
 
 class TidelineMemoryProvider(MemoryProvider):
-    """Read-only auto-injection from Portalk MCP memory DB."""
+    """Read-only auto-injection from Tideline MCP memory DB."""
 
     def __init__(self):
         self._db_path = _DB_PATH
@@ -89,7 +91,7 @@ class TidelineMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._turn_count = 0
-        logger.info("Portalk memory provider initialized (session=%s, db=%s)",
+        logger.info("Tideline memory provider initialized (session=%s, db=%s)",
                      session_id, self._db_path)
 
     # ═══ T0: System Prompt Block ═══════════════════════════
@@ -175,7 +177,7 @@ class TidelineMemoryProvider(MemoryProvider):
             return "\n\n".join(parts)
 
         except Exception as e:
-            logger.warning("Portalk system_prompt_block failed: %s", e)
+            logger.warning("Tideline system_prompt_block failed: %s", e)
             return ""
 
     # ═══ T1: Prefetch (per-turn semantic search) ══════════
@@ -253,7 +255,7 @@ class TidelineMemoryProvider(MemoryProvider):
             return result
 
         except Exception as e:
-            logger.warning("Portalk prefetch failed: %s", e)
+            logger.warning("Tideline prefetch failed: %s", e)
             return ""
 
     def _t4_fts_search(self, c, query: str, c_ids: list) -> str:
@@ -334,7 +336,7 @@ class TidelineMemoryProvider(MemoryProvider):
             c.commit()
             c.close()
         except Exception as e:
-            logger.debug("Portalk sync_turn failed: %s", e)
+            logger.debug("Tideline sync_turn failed: %s", e)
 
     # ═══ on_pre_compress (rescue) ═════════════════════════
 
@@ -352,14 +354,14 @@ class TidelineMemoryProvider(MemoryProvider):
             if not rows:
                 return ""
 
-            lines = ["[Portalk memory rescue] 高权重记忆不可遗忘：\n"]
+            lines = ["[Tideline memory rescue] 高权重记忆不可遗忘：\n"]
             for r in rows:
                 cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
                 lines.append(f"- {r['gesture']}{cd}")
             return "\n".join(lines)
 
         except Exception as e:
-            logger.debug("Portalk on_pre_compress failed: %s", e)
+            logger.debug("Tideline on_pre_compress failed: %s", e)
             return ""
 
     # ═══ No tools (MCP server handles interactive) ════════
@@ -369,4 +371,4 @@ class TidelineMemoryProvider(MemoryProvider):
         return []
 
     def shutdown(self) -> None:
-        logger.info("Portalk memory provider shutdown")
+        logger.info("Tideline memory provider shutdown")
