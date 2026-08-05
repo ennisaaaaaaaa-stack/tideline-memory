@@ -1,7 +1,7 @@
 # Memory Architecture v2.3 — Blueprint
 
 > 2026-08-04 · 洄 × 甜心
-> 架构图: `/home/ubuntu/memory-arch-v2.3.html` + `.png`
+> 架构图: `docs/memory-arch-v2.3.html` (+ `.png`)
 
 ---
 

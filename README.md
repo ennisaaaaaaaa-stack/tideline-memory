@@ -62,6 +62,17 @@ Agent memory isn't a storage problem — it's a retrieval problem. Most of the t
     T4: active retrieval (embedding + FTS5, fallback)
 ```
 
+### Layer 0 — Solidification (固化)
+
+Before the DREAM three layers (combing / drifting / dreaming), a **Layer 0** runs first: a deterministic scanner detects unindexed conversation context so it can be solidified into narrative memories.
+
+- **`scan_unindexed.py`** — two-track detector (no LLM, zero token cost):
+  - **Track A**: narratives with empty `source_links` (potentially unindexed)
+  - **Track B**: timestamp gap — conversation entries (`sync_turn`) after the latest narrative, grouped into time-proximity chunks
+- **`source_links` tracking** — every new narrative back-links to the raw context IDs it came from. The narrative is the signal; `source_links` are the trail back to the texture.
+
+The scanner's markdown output feeds into [`prompts/dream_solidify.md`](prompts/dream_solidify.md), which guides the LLM through judgment (what's worth keeping) and writing (structured `memory_write` with `source_links` filled).
+
 ## Features
 
 ### Memory types
@@ -162,10 +173,12 @@ tideline-memory/
 ├── server.py                  # MCP server: memory tools, hybrid search, weights
 ├── import_sessions.py         # Session import (auto-import via cron)
 ├── scripts/
-│   └── dream_scripts.py       # Deterministic layer: jieba clustering + weight normalization
+│   ├── dream_scripts.py       # Deterministic layer: jieba clustering + weight normalization
+│   └── scan_unindexed.py      # Layer 0: solidification scanner (two-track unindexed detection)
 ├── prompts/
 │   ├── dream_digest.md        # DREAM layer 1: combing prompt
-│   └── dream_sleep.md         # DREAM layer 2-3: night drift + symbolic dream
+│   ├── dream_sleep.md         # DREAM layer 2-3: night drift + symbolic dream
+│   └── dream_solidify.md      # Layer 0: solidification prompt (reads scanner output)
 ├── ARCHITECTURE-V2.3.md       # Full architecture blueprint (design doc)
 ├── LICENSE
 └── README.md
