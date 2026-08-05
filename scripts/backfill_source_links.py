@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Backfill source_links for existing narratives.
 
@@ -123,14 +122,16 @@ def backfill():
     c.commit()
 
     # Final count
-    still_empty = c.execute(
+    still_empty_count = c.execute(
         "SELECT COUNT(*) FROM narratives WHERE source_links IS NULL OR source_links = '' OR source_links = '[]'"
-    ).fetchone()
+    ).fetchone()[0]
+
+    total_count = c.execute("SELECT COUNT(*) FROM narratives").fetchone()[0]
 
     print("\n=== Results ===")
     print("  Updated: {}".format(updated))
     print("  Skipped (no matching context): {}".format(skipped))
-    print("  Still empty: {} of {} total".format(still_empty[0], empty[0] if empty else 0))
+    print("  Still empty: {} of {} total".format(still_empty_count, total_count))
 
     c.close()
 
