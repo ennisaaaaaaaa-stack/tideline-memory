@@ -58,10 +58,23 @@ Agent memory isn't a storage problem — it's a retrieval problem. Most of the t
     T0: identity anchor (SOUL.md + self_concept + snapshot)
     T1: session bridge (recent context + semantic retrieval)
     T2: prefetch cache (high-weight + topic-relevant)
-    ─────────────────────────────
-    T3: memory map (cluster index + profiles)     ← roadmap
-    T4: active retrieval (embedding + FTS5)       ← roadmap
+    T3: memory map (cluster index + profiles)
+    T4: active retrieval (embedding + FTS5)
 ```
+
+### Injection layers
+
+Tideline injects memory into the model's context through five layers. Layers T0/T2/T3 use a **system_prompt_block** hook (session-start identity block). T1/T4 use a **prefetch** hook (per-turn semantic search). Auto-injection requires a runtime that exposes a provider plugin hook (e.g. Hermes Agent's plugin layer). MCP-only clients get the same data through interactive tools, but without automatic injection.
+
+| Layer | Hook | What it does | Status |
+|-------|------|-------------|--------|
+| T0 | system_prompt_block | Identity anchor: self-concept + snapshot + open threads + high-weight memory pool | ✅ |
+| T1 | prefetch | Semantic search: recent 100 narratives, embedding cosine >0.25 | ✅ |
+| T2 | system_prompt_block | High-weight prefetch pool (weight>0.6, last 7 days, top 5) | ✅ |
+| T3 | system_prompt_block | Memory map: top 25 topic clusters + all entity profiles | ✅ |
+| T4 | prefetch fallback | Full-corpus FTS5 keyword search when T1 returns <2 results | ✅ |
+
+Reference implementation: [`plugins/tideline_provider.py`](plugins/tideline_provider.py).
 
 ### Layer 0 — Solidification (固化)
 
@@ -174,9 +187,12 @@ python3.12 scripts/dream_scripts.py all
 tideline-memory/
 ├── server.py                  # MCP server: memory tools, hybrid search, weights
 ├── import_sessions.py         # Session import (auto-import via cron)
+├── plugins/
+│   └── tideline_provider.py   # T0-T4 auto-injection provider (Hermes plugin layer)
 ├── scripts/
 │   ├── dream_scripts.py       # Deterministic layer: jieba clustering + weight normalization
-│   └── scan_unindexed.py      # Layer 0: solidification scanner (two-track unindexed detection)
+│   ├── scan_unindexed.py      # Layer 0: solidification scanner (two-track unindexed detection)
+│   └── backfill_source_links.py  # Backfill source_links for pre-existing narratives
 ├── prompts/
 │   ├── dream_digest.md        # DREAM layer 1: combing prompt
 │   ├── dream_sleep.md         # DREAM layer 2-3: night drift + symbolic dream
