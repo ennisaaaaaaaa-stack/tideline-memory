@@ -76,6 +76,8 @@ Tideline injects memory into the model's context through five layers. Layers T0/
 
 Reference implementation: [`plugins/tideline_provider.py`](plugins/tideline_provider.py).
 
+> **Tuning thresholds**: All injection thresholds are configurable — T2's weight cutoff (>0.6), T3's cluster count (25), T1's semantic floor (cosine >0.25), T4's trigger condition (T1 returns <2). Adjust to your agent's needs and token budget. Current production usage is ~9,000 tokens for the full T0+T2+T3 injection block.
+
 ### Layer 0 — Solidification (固化)
 
 Before the DREAM three layers (combing / drifting / dreaming), a **Layer 0** runs first: a deterministic scanner detects unindexed conversation context so it can be solidified into narrative memories.
@@ -197,7 +199,6 @@ tideline-memory/
 │   ├── dream_digest.md        # DREAM layer 1: combing prompt
 │   ├── dream_sleep.md         # DREAM layer 2-3: night drift + symbolic dream
 │   └── dream_solidify.md      # Layer 0: solidification prompt (reads scanner output)
-├── ARCHITECTURE-V2.3.md       # Full architecture blueprint (design doc)
 ├── LICENSE
 └── README.md
 ```
