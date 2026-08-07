@@ -96,6 +96,49 @@ def _embed(text: str) -> list:
         logger.debug("embed failed: %s", e)
         return []
 
+# ─── Conversation extraction helper ──────────────────────
+
+def _extract_conversation(messages: list) -> list:
+    """Extract (role, text) pairs from OpenAI-style messages.
+
+    Filters out:
+    - system messages (already in system prompt)
+    - tool calls / tool results (no semantic value for memory)
+    - trivial messages (under 10 chars)
+    - duplicate consecutive messages
+    """
+    extracted = []
+    seen = set()
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "system":
+            continue
+
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content = " ".join(text_parts)
+        elif not isinstance(content, str):
+            continue
+
+        content = content.strip()
+        if len(content) < 10:
+            continue
+
+        key = content[:200]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        extracted.append((role.upper(), content))
+
+    return extracted
+
 # ─── Provider ─────────────────────────────────────────────
 
 class TidelineMemoryProvider(MemoryProvider):
@@ -465,7 +508,38 @@ class TidelineMemoryProvider(MemoryProvider):
     # ═══ on_pre_compress (rescue) ═════════════════════════
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Before context compression, remind what matters."""
+        """Before context compression: persist raw messages, then remind.
+
+        Two things happen here:
+        1. Extract user messages and key assistant content from the messages
+           about to be discarded, and persist them to the context table with
+           embeddings so they remain searchable after the buffer is gone.
+        2. Return high-weight memory reminders for the compression summary
+           prompt so the compressor preserves them.
+        """
+        # ── Phase 1: Persist messages about to be lost ──
+        try:
+            extracted = _extract_conversation(messages)
+            if extracted:
+                c = _db()
+                for role, text in extracted:
+                    content = f"[{role}] {text[:2000]}"
+                    emb = _embed(content[:500])
+                    emb_json = json.dumps(emb) if emb else None
+                    c.execute(
+                        "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
+                        (content, emb_json, _now()),
+                    )
+                c.commit()
+                c.close()
+                logger.info(
+                    "Tideline on_pre_compress: persisted %d messages before compression",
+                    len(extracted),
+                )
+        except Exception as e:
+            logger.debug("Tideline on_pre_compress persist failed: %s", e)
+
+        # ── Phase 2: Return high-weight memory reminders ──
         try:
             c = _db()
             rows = c.execute(
@@ -485,7 +559,7 @@ class TidelineMemoryProvider(MemoryProvider):
             return "\n".join(lines)
 
         except Exception as e:
-            logger.debug("Tideline on_pre_compress failed: %s", e)
+            logger.debug("Tideline on_pre_compress reminder failed: %s", e)
             return ""
 
     # ═══ No tools (MCP server handles interactive) ════════
