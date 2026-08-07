@@ -182,6 +182,7 @@ def _migrate_narratives(c):
         ("emotional", "INTEGER"),
         ("recurrence", "INTEGER"),
         ("unresolved", "INTEGER"),
+        ("entities_role", "TEXT"),
     ]
     for col, sqltype in new_cols:
         if col not in cols:
@@ -225,32 +226,38 @@ def _is_local_emb() -> bool:
     """True if embedding service is on localhost (no API key needed)."""
     return "localhost" in _EMB_URL or "127.0.0.1" in _EMB_URL
 
-async def _embed(text: str):
-    """Return embedding vector via local bge-m3 or remote OpenAI-compatible API."""
-    try:
-        import httpx
-        headers = {}
-        payload_key = "texts"
-        payload = {payload_key: [text[:5000]]}
+async def _embed(text: str, _retries: int = 3):
+    """Return embedding vector via local bge-m3 or remote OpenAI-compatible API.
 
-        if _is_local_emb():
-            # Local bge-m3: POST {"texts": [...]} → {"embeddings": [[...]]}
-            async with httpx.AsyncClient(trust_env=False, timeout=30) as cli:
-                r = await cli.post(_EMB_URL, json=payload)
-                r.raise_for_status()
-                return r.json()["embeddings"][0]
-        else:
-            # Remote OpenAI-compatible: POST {"model":..., "input":...} with Bearer
-            headers["Authorization"] = f"Bearer {_EMB_KEY}"
-            payload = {"model": _EMB_MODEL, "input": text[:5000]}
-            async with httpx.AsyncClient(trust_env=False, timeout=30) as cli:
-                r = await cli.post(_EMB_URL, json=payload, headers=headers)
-                r.raise_for_status()
-                data = r.json()
-                return data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
-    except Exception as e:
-        print(f"[memory-mcp] embed error: {e}", file=sys.stderr)
-        return None
+    Includes retry logic — embedding server may be briefly unavailable.
+    Logs to stderr on each failure so silent drops are visible.
+    """
+    import httpx, asyncio as _aio
+    last_err = None
+    for attempt in range(_retries):
+        try:
+            headers = {}
+            if _is_local_emb():
+                payload = {"texts": [text[:5000]]}
+                async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
+                    r = await cli.post(_EMB_URL, json=payload)
+                    r.raise_for_status()
+                    return r.json()["embeddings"][0]
+            else:
+                headers["Authorization"] = f"Bearer {_EMB_KEY}"
+                payload = {"model": _EMB_MODEL, "input": text[:5000]}
+                async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
+                    r = await cli.post(_EMB_URL, json=payload, headers=headers)
+                    r.raise_for_status()
+                    data = r.json()
+                    return data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
+        except Exception as e:
+            last_err = e
+            print(f"[memory-mcp] embed attempt {attempt+1}/{_retries} failed: {e}", file=sys.stderr)
+            if attempt < _retries - 1:
+                await _aio.sleep(2 * (attempt + 1))
+    print(f"[memory-mcp] EMBED FAILED after {_retries} retries: {last_err}", file=sys.stderr)
+    return None
 
 def _cosine(a, b):
     dot = sum(x * y for x, y in zip(a, b))
@@ -259,28 +266,47 @@ def _cosine(a, b):
     return dot / (na * nb) if na and nb else 0.0
 
 # ─── Keyword Search (FTS5 + LIKE fallback) ───────────────
-def _kw_search(c, query, limit=20):
-    """Fast keyword search: FTS5 trigram for >=3 chars, LIKE for shorter."""
+def _kw_search(c, query, limit=20, time_filter="", time_params=None):
+    """Fast keyword search: FTS5 trigram for >=3 chars, LIKE for shorter.
+    time_filter: optional SQL fragment like ' WHERE created_at >= ?' to narrow by date.
+    """
+    if time_params is None:
+        time_params = []
     results = []
     # FTS5 path: fast trigram substring matching
     if len(query) >= 3:
         try:
-            rows = c.execute(
-                """SELECT c.* FROM context_fts f
-                   JOIN context c ON c.id = f.rowid
-                   WHERE context_fts MATCH ?
-                   ORDER BY rank LIMIT ?""",
-                (f'"{query}"', limit),
-            ).fetchall()
+            if time_filter:
+                # When time filter is set, we need to join and filter
+                sql = f"""SELECT c.* FROM context_fts f
+                         JOIN context c ON c.id = f.rowid
+                         WHERE context_fts MATCH ? AND {' AND '.join(
+                             [t.replace('created_at', 'c.created_at') for t in
+                              time_filter.replace(' WHERE ', '').split(' AND ')]
+                         )}
+                         ORDER BY rank LIMIT ?"""
+                rows = c.execute(sql, [f'"{query}"'] + time_params + [limit]).fetchall()
+            else:
+                rows = c.execute(
+                    """SELECT c.* FROM context_fts f
+                       JOIN context c ON c.id = f.rowid
+                       WHERE context_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (f'"{query}"', limit),
+                ).fetchall()
             results = list(rows)
         except Exception:
             pass
     # LIKE fallback: for <3 char queries or FTS miss
     if not results:
-        rows = c.execute(
-            "SELECT * FROM context WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?",
-            (f"%{query}%", limit),
-        ).fetchall()
+        if time_filter:
+            sql = f"SELECT * FROM context WHERE content LIKE ? AND {time_filter.replace(' WHERE ', '')} ORDER BY created_at DESC LIMIT ?"
+            rows = c.execute(sql, [f"%{query}%"] + time_params + [limit]).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM context WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?",
+                (f"%{query}%", limit),
+            ).fetchall()
         results = list(rows)
     return results
 
@@ -347,7 +373,10 @@ async def list_tools() -> list[types.Tool]:
             "moment 是时间标记，cognition_direction 是认知方向。\\n\\n"
             "多维度权重：importance/emotional/recurrence/unresolved (1-5)，"
             "系统自动换算为复合权重 + 分布归一化防通胀。\\n\\n"
-            "related_entities: 关联人/实体列表。\\n"
+            "entities_role: 多人参与时填写角色分工（如 A审核→B判断→C执行），"
+            "核实每个行为归属到正确的实体。\\n"
+            "tags: 必须包含关联人的实际称呼（不要用泛称）。\\n"
+            "related_entities: 无需手动填写，系统基于 tags 自动生成。\\n"
             "source_links: 关联的原始上下文 ID 列表（叙事 → 原始上下文索引）。"
         ),
         inputSchema={
@@ -364,7 +393,7 @@ async def list_tools() -> list[types.Tool]:
                 "related_entities": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "关联人/实体列表",
+                    "description": "（自动）由系统基于 tags 中的已知人名生成，无需手动填写。",
                 },
                 "source_links": {
                     "type": "array",
@@ -374,7 +403,11 @@ async def list_tools() -> list[types.Tool]:
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "标签列表",
+                    "description": "标签列表。必须包含关联人的实际称呼（不要用泛称如'user'），可混放主题词。人名是检索入口。",
+                },
+                "entities_role": {
+                    "type": "string",
+                    "description": "多人参与时填写角色分工，核实每个行为归属到正确的实体。单人不参与的事件可不填。",
                 },
                 # legacy field — still accepted for backward compat
                 "content": {"type": "string", "description": "（旧格式）自由文本，如果用了结构化字段可忽略"},
@@ -410,9 +443,12 @@ async def list_tools() -> list[types.Tool]:
         description=(
             "👤 记住一个人——你自己、朋友、任何人。\\n\\n"
             "v2.3 三字段结构（不记经历，经历在叙事记忆里）：\\n"
-            "  fact          客观事实（几岁、住哪、生日、兴趣爱好）\\n"
-            "  impression    我对ta的理解结构——ta在我眼里是什么样的人\\n"
+            "  fact          客观事实\\n"
+            "  impression    我对ta的理解结构\\n"
             "  relationship  我和ta的关系结构描述\\n\\n"
+            "⚠️ 注意归属：多人协作场景要核实每个行为归到正确的实体。"
+            "可在 entities_role 字段里追溯，如有矛盾/不确定，可核查 source_links。"
+            "\\n\\n"
             "每次写入会更新对应字段（DREAM 里 LLM 也可以更新）。"
         ),
         inputSchema={
@@ -536,12 +572,15 @@ async def list_tools() -> list[types.Tool]:
         description=(
             "🔍 在记忆里搜索。配了 embedding key 时自动用语义搜索，"
             "没配则文本匹配。同时搜叙事记忆和完整上下文。"
+            "可用 since/until 按时间范围过滤（格式：YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS）。"
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "搜索词"},
                 "limit": {"type": "integer", "default": 5},
+                "since": {"type": "string", "description": "起始时间（含），格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS"},
+                "until": {"type": "string", "description": "结束时间（含），格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS"},
             },
             "required": ["query"],
         },
@@ -619,9 +658,9 @@ async def _dispatch(name, a, c):
         context_layer = a.get("context", "")
         moment_val = a.get("moment", "")
         cog_dir = a.get("cognition_direction", "")
-        related = a.get("related_entities", [])
         links = a.get("source_links", [])
         tags = a.get("tags", [])
+        entities_role = a.get("entities_role", "")
         ntype = a.get("narrative_type", "general")
         # weight dimensions
         imp = a.get("importance")
@@ -639,16 +678,22 @@ async def _dispatch(name, a, c):
         # build embedding from gesture + cognition_direction (most semantic info)
         emb = await _embed(content)
 
+        # auto-generate related_entities from tags (known person names)
+        KNOWN_PERSONS = {"甜心", "照照", "泡泡", "self", "洄", "用户"}
+        related = [t for t in tags if t in KNOWN_PERSONS]
+        if not related:
+            related = a.get("related_entities", [])  # fallback to manual if no tags match
+
         c.execute(
             """INSERT INTO narratives
                (content, ntype, tags, embedding, created_at,
                 gesture, context_layer, moment, cognition_direction,
-                related_entities, source_links,
+                related_entities, source_links, entities_role,
                 weight, importance, emotional, recurrence, unresolved)
-               VALUES (?,?,?,?,?, ?,?,?,?, ?,?, ?,?,?,?,?)""",
+               VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?,?)""",
             (content, ntype, json.dumps(tags), json.dumps(emb) if emb else None, _now(),
              gesture, context_layer, moment_val, cog_dir,
-             json.dumps(related), json.dumps(links),
+             json.dumps(related), json.dumps(links), entities_role,
              weight, imp, emo, rec, unr),
         )
         c.commit()
@@ -808,28 +853,67 @@ async def _dispatch(name, a, c):
     # ── memory_search ── (hybrid: keyword + semantic)
     if name == "memory_search":
         query = a["query"]
+        since = a.get("since")
+        until = a.get("until")
         results = []  # (score, source, text, boost)
 
-        # 1. Keyword search — context (FTS5 + LIKE fallback)
-        for r in _kw_search(c, query, limit=limit*2):
+        # Build time filter SQL fragment
+        time_clauses = []
+        time_params = []
+        if since:
+            time_clauses.append("created_at >= ?")
+            time_params.append(since)
+        if until:
+            time_clauses.append("created_at <= ?")
+            time_params.append(until)
+        time_filter = (" WHERE " + " AND ".join(time_clauses)) if time_clauses else ""
+
+        # 1. Keyword search — context (FTS5 + LIKE fallback, with time filter)
+        for r in _kw_search(c, query, limit=limit*2, time_filter=time_filter, time_params=time_params):
             results.append((1.0, "🔑上下文", _fmt_context(r), 0.3))
 
-        # 2. Keyword search — narratives (LIKE, small table)
-        nar_kw = c.execute(
-            "SELECT * FROM narratives WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?",
-            (f"%{query}%", limit),
-        ).fetchall()
+        # 2. Keyword search — narratives (LIKE, with time filter)
+        nar_sql = "SELECT * FROM narratives WHERE content LIKE ?"
+        nar_params = [f"%{query}%"]
+        if since:
+            nar_sql += " AND created_at >= ?"
+            nar_params.append(since)
+        if until:
+            nar_sql += " AND created_at <= ?"
+            nar_params.append(until)
+        nar_sql += " ORDER BY created_at DESC LIMIT ?"
+        nar_params.append(limit)
+        nar_kw = c.execute(nar_sql, nar_params).fetchall()
         for r in nar_kw:
             results.append((1.0, "🔑记忆", _fmt_narrative(r), 0.3))
 
-        # 3. Semantic search (supplements keyword matches)
+        # 3. Semantic search (supplements keyword matches, with time filter)
         emb = await _embed(query)
         if emb:
-            for r in c.execute("SELECT * FROM narratives WHERE embedding IS NOT NULL ORDER BY created_at DESC").fetchall():
+            nar_sem_sql = "SELECT * FROM narratives WHERE embedding IS NOT NULL"
+            nar_sem_params = []
+            if since:
+                nar_sem_sql += " AND created_at >= ?"
+                nar_sem_params.append(since)
+            if until:
+                nar_sem_sql += " AND created_at <= ?"
+                nar_sem_params.append(until)
+            nar_sem_sql += " ORDER BY created_at DESC"
+            for r in c.execute(nar_sem_sql, nar_sem_params).fetchall():
                 score = _cosine(emb, json.loads(r["embedding"]))
                 if score > 0.3:
                     results.append((score, "🧠记忆", _fmt_narrative(r), 0))
-            ctx_rows = c.execute("SELECT * FROM context WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT 5000").fetchall()
+
+            ctx_sem_sql = "SELECT * FROM context WHERE embedding IS NOT NULL"
+            ctx_sem_params = []
+            if since:
+                ctx_sem_sql += " AND created_at >= ?"
+                ctx_sem_params.append(since)
+            if until:
+                ctx_sem_sql += " AND created_at <= ?"
+                ctx_sem_params.append(until)
+            ctx_sem_sql += " ORDER BY created_at DESC LIMIT 5000"
+            ctx_rows = c.execute(ctx_sem_sql, ctx_sem_params).fetchall()
             scored = []
             for r in ctx_rows:
                 scored.append((_cosine(emb, json.loads(r["embedding"])), r))
