@@ -14,6 +14,7 @@ from collections import defaultdict
 DB_PATH = os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db"))
 SESSIONS_DIR = os.path.expanduser(os.environ.get("HERMES_SESSIONS_DIR", "~/.hermes/sessions"))
 EMB_URL = os.environ.get("EMBEDDING_API_URL", "http://localhost:18001/embed_batch")
+AGENT_NAME = os.environ.get("AGENT_NAME", "agent")
 
 def now_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -179,7 +180,7 @@ def create_weekly_summary(sessions_in_week):
             for ut in user_text[:3]:
                 lines.append(f"  用户: {ut}")
             for at in asst_text[:2]:
-                lines.append(f"  洄: {at}")
+                lines.append(f"  {AGENT_NAME}: {at}")
             lines.append("")
     
     return "\n".join(lines)

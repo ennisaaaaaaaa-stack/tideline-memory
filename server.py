@@ -39,6 +39,8 @@ def _db():
 def _init():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     c = _db()
+    # Phase 1: Create tables (no triggers/FTS yet — triggers reference
+    # v2.3 columns that may not exist on a fresh-from-v2.2 DB)
     c.executescript("""
     -- ═══════ narratives: structured memory (v2.3) ═══════
     CREATE TABLE IF NOT EXISTS narratives(
@@ -55,6 +57,7 @@ def _init():
         cognition_direction TEXT,        -- 认知方向——"从X切换到Y"
         related_entities TEXT,           -- JSON array of entity names
         source_links TEXT,               -- JSON array of context row IDs
+        entities_role TEXT,              -- role assignment for multi-entity narratives
         -- v2.3 weight
         weight REAL,                     -- computed weight (0.0-1.0)
         importance INTEGER,              -- 1-5, LLM fills
@@ -116,6 +119,29 @@ def _init():
         avg_weight REAL DEFAULT 0.0
     );
 
+    -- ═══════ v2.3 NEW: entity graph tables ═══════
+    CREATE TABLE IF NOT EXISTS graph_nodes(
+        entity TEXT PRIMARY KEY,
+        mention_count INTEGER DEFAULT 0,
+        first_seen TEXT,
+        last_seen TEXT
+    );
+    CREATE TABLE IF NOT EXISTS graph_edges(
+        entity_a TEXT,
+        entity_b TEXT,
+        narrative_id INTEGER,
+        role_a TEXT,
+        role_b TEXT,
+        created_at TEXT,
+        FOREIGN KEY (narrative_id) REFERENCES narratives(id)
+    );
+    CREATE TABLE IF NOT EXISTS graph_cooccur(
+        entity_a TEXT,
+        entity_b TEXT,
+        cooccur_count INTEGER DEFAULT 0,
+        PRIMARY KEY (entity_a, entity_b)
+    );
+
     -- v2.3: profile ptype expanded to include fact/impression/relationship
     -- (no schema change needed — ptype is already a free TEXT field)
 
@@ -125,7 +151,16 @@ def _init():
     CREATE INDEX IF NOT EXISTS ix_ctx_ca    ON context(created_at);
     CREATE INDEX IF NOT EXISTS ix_threads_status ON threads(status);
     CREATE INDEX IF NOT EXISTS ix_threads_weight ON threads(weight);
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_a ON graph_edges(entity_a);
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_b ON graph_edges(entity_b);
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_narrative ON graph_edges(narrative_id);
+    """)
+    # Phase 2: migrate existing tables BEFORE creating triggers/FTS
+    # (triggers reference v2.3 columns — must exist first)
+    _migrate_narratives(c)
 
+    # Phase 3: FTS5 + triggers (now all columns are guaranteed to exist)
+    c.executescript("""
     -- FTS5 full-text index for hybrid keyword search
     CREATE VIRTUAL TABLE IF NOT EXISTS context_fts
         USING fts5(content, content_rowid='id', tokenize='trigram');
@@ -162,8 +197,6 @@ def _init():
         VALUES (new.id, new.gesture, new.context_layer, new.cognition_direction, new.tags);
     END;
     """)
-    # v2.3 migration: add new columns to existing narratives table if missing
-    _migrate_narratives(c)
     c.commit(); c.close()
 
 # ─── v2.3 Migration ──────────────────────────────────────
@@ -189,6 +222,8 @@ def _migrate_narratives(c):
             c.execute(f"ALTER TABLE narratives ADD COLUMN {col} {sqltype}")
 
 # ─── v2.3 Weight Engine ──────────────────────────────────
+# NOTE: scripts/dream_scripts.py has an identical copy for the cron layer.
+# Keep both in sync when changing the formula.
 def _compute_weight(imp, emo, rec, unr):
     """Multi-dimensional weight → normalized 0-1."""
     if None in (imp, emo, rec, unr):
@@ -216,11 +251,10 @@ def _normalize_weights(c, window=20):
         c.execute("UPDATE narratives SET weight = ? WHERE id = ?", (new_w, r["id"]))
 
 # ─── Embedding ───────────────────────────────────────────
-import os as _os
 
-_EMB_URL = _os.environ.get("EMBEDDING_API_URL", "http://localhost:18001/embed_batch")
-_EMB_KEY = _os.environ.get("EMBEDDING_API_KEY", "")
-_EMB_MODEL = _os.environ.get("EMBEDDING_MODEL", "embedding-3")
+_EMB_URL = os.environ.get("EMBEDDING_API_URL", "http://localhost:18001/embed_batch")
+_EMB_KEY = os.environ.get("EMBEDDING_API_KEY", "")
+_EMB_MODEL = os.environ.get("EMBEDDING_MODEL", "embedding-3")
 
 def _is_local_emb() -> bool:
     """True if embedding service is on localhost (no API key needed)."""
@@ -716,7 +750,8 @@ async def _dispatch(name, a, c):
         emb = await _embed(content)
 
         # auto-generate related_entities from tags (known person names)
-        KNOWN_PERSONS = {"甜心", "照照", "泡泡", "self", "洄", "用户"}
+        _persons = os.environ.get("KNOWN_PERSONS", "")
+        KNOWN_PERSONS = set(_persons.split(",")) if _persons else {AGENT, "self"}
         related = [t for t in tags if t in KNOWN_PERSONS]
         if not related:
             related = a.get("related_entities", [])  # fallback to manual if no tags match
