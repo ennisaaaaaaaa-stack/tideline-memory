@@ -384,7 +384,6 @@ def backfill_weights():
 # ─── 2b. Recurrence Refresh ──────────────────────────────
 def refresh_recurrence():
     """Recalculate recurrence for ALL narratives based on current tag frequencies."""
-    import json
     c = _db()
 
     # Build tag frequency map

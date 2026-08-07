@@ -102,6 +102,7 @@ def rebuild_graph(db_path: Path):
     db = sqlite3.connect(str(db_path))
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=30000")
 
     # Clear existing graph data
     db.executescript("""
@@ -198,6 +199,8 @@ if __name__ == "__main__":
 
     # Ensure tables exist
     db = sqlite3.connect(str(db_path))
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=30000")
     init_graph_tables(db)
     db.close()
 

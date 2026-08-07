@@ -68,6 +68,8 @@ def _group_chunks(rows):
 def scan(since=None, output_format="markdown"):
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=30000")
 
     # ── Track A: narratives with empty source_links ──
     # These are potentially unindexed — need LLM to check if their content

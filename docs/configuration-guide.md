@@ -25,7 +25,7 @@ pip install mcp httpx jieba
 }
 ```
 
-启动客户端，工具列表里应该能看到 `memory_write`、`memory_search`、`context_record` 等 14 个工具。
+启动客户端，工具列表里应该能看到 `memory_write`、`memory_search`、`context_record` 等 15 个工具。
 
 没配 embedding？没问题，服务器自动降级为纯关键词搜索，所有功能照常运行，只是语义匹配被跳过。
 
@@ -40,6 +40,7 @@ pip install mcp httpx jieba
 | `EMBEDDING_API_URL` | `http://localhost:18001/embed_batch` | Embedding 服务端点（见下方） |
 | `EMBEDDING_API_KEY` | （空） | 远程 API 密钥，本地服务不需要 |
 | `EMBEDDING_MODEL` | `embedding-3` | 远程 API 使用的模型名 |
+| `KNOWN_PERSONS` | （空） | 逗号分隔的已知人物名，用于自动生成 related_entities（如 `Alice,Bob,Carol`）。不设则只用 AGENT_NAME |
 
 ---
 

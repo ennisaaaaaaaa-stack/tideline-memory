@@ -44,10 +44,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(_DB_PATH, timeout=5)
+    c = sqlite3.connect(_DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=5000")
+    c.execute("PRAGMA busy_timeout=30000")
     return c
 
 def _cosine(a: list, b: list) -> float:
@@ -307,7 +307,6 @@ class TidelineMemoryProvider(MemoryProvider):
                 scan_rows = rows[:SCAN_LIMIT]
                 scan_truncated = True
 
-            import json
             scored = []
             for r in scan_rows:
                 emb_raw = r["embedding"]
@@ -462,10 +461,15 @@ class TidelineMemoryProvider(MemoryProvider):
         for sess, chunk_list in sessions.items():
             chunk_ids = [str(r["id"]) for r in chunk_list]
             # Find narratives whose source_links reference any of these chunks
+            # source_links is JSON array — use json_each to match chunk IDs
+            placeholders = ",".join("?" * len(chunk_ids))
             linked = c.execute(
-                """SELECT MAX(weight) as w FROM narratives
-                   WHERE source_links LIKE '%' || ? || '%'""",
-                ("|" + "|".join(chunk_ids) + "|",),
+                f"""SELECT MAX(n.weight) as w FROM narratives n
+                   WHERE EXISTS (
+                       SELECT 1 FROM json_each(n.source_links) je
+                       WHERE CAST(je.value AS TEXT) IN ({placeholders})
+                   )""",
+                chunk_ids,
             ).fetchone()
             score = (linked["w"] or 0) if linked else 0
             # Newer sessions get slight boost
@@ -526,9 +530,10 @@ class TidelineMemoryProvider(MemoryProvider):
                     content = f"[{role}] {text[:2000]}"
                     emb = _embed(content[:500])
                     emb_json = json.dumps(emb) if emb else None
+                    meta = json.dumps({"source": "pre_compress", "role": role})
                     c.execute(
-                        "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
-                        (content, emb_json, _now()),
+                        "INSERT INTO context (content, embedding, meta, created_at) VALUES (?, ?, ?, ?)",
+                        (content, emb_json, meta, _now()),
                     )
                 c.commit()
                 c.close()
