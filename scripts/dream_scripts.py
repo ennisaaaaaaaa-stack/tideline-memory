@@ -381,6 +381,58 @@ def backfill_weights():
     c.close()
     print(f"✅ Weight backfill: {count} narratives assigned weights")
 
+# ─── 2b. Recurrence Refresh ──────────────────────────────
+def refresh_recurrence():
+    """Recalculate recurrence for ALL narratives based on current tag frequencies."""
+    import json
+    c = _db()
+
+    # Build tag frequency map
+    all_tags = {}
+    rows = c.execute("SELECT id, tags FROM narratives WHERE tags IS NOT NULL").fetchall()
+    for r in rows:
+        try:
+            tags = json.loads(r["tags"])
+            for t in tags:
+                all_tags[t] = all_tags.get(t, 0) + 1
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    def _rec_from_freq(freq):
+        if freq <= 1: return 1
+        elif freq <= 3: return 2
+        elif freq <= 6: return 3
+        elif freq <= 11: return 4
+        else: return 5
+
+    updated = 0
+    for r in rows:
+        try:
+            tags = json.loads(r["tags"])
+        except:
+            tags = []
+        if not tags:
+            continue
+
+        co_count = max(all_tags.get(t, 0) - 1 for t in tags) if tags else 0
+        new_rec = _rec_from_freq(co_count)
+
+        full = c.execute(
+            "SELECT importance, emotional, unresolved FROM narratives WHERE id = ?",
+            (r["id"],),
+        ).fetchone()
+        if not full:
+            continue
+
+        new_weight = _compute_weight(full["importance"], full["emotional"], new_rec, full["unresolved"])
+        c.execute("UPDATE narratives SET recurrence = ?, weight = ? WHERE id = ?", (new_rec, new_weight, r["id"]))
+        updated += 1
+
+    c.commit()
+    c.close()
+    print(f"✅ Recurrence refreshed: {updated} narratives updated from {len(all_tags)} unique tags")
+
+
 # ─── 3. Weight Normalization ─────────────────────────────
 def normalize_all():
     """Run distribution normalization across all narratives."""
@@ -409,11 +461,13 @@ if __name__ == "__main__":
     if cmd in ("weights", "all"):
         print("\n═══ Weight Backfill ═══")
         backfill_weights()
+        print("\n═══ Recurrence Refresh ═══")
+        refresh_recurrence()
         print("\n═══ Weight Normalization ═══")
         normalize_all()
 
     if cmd == "all":
         print("\n✅ All scripts complete.")
-    elif cmd not in ("clusters", "weights"):
+    elif cmd not in ("clusters", "weights", "recurrence"):
         print(f"Unknown command: {cmd}")
-        print("Usage: python3 dream_scripts.py [clusters|weights|all]")
+        print("Usage: python3 dream_scripts.py [clusters|weights|recurrence|all]")
