@@ -732,6 +732,56 @@ async def _dispatch(name, a, c):
              weight, imp, emo, rec, unr),
         )
         c.commit()
+
+        # ── Propagate recurrence to older narratives sharing same tags ──
+        # Writing a new memory with tag X increases the frequency of X,
+        # so all older narratives with tag X should have their recurrence
+        # (and therefore weight) refreshed. This keeps recurrence alive
+        # — never locked at write-time.
+        if tags:
+            tag_placeholders = " OR ".join(["tags LIKE ?"] * len(tags))
+            tag_params = [f'%"{t}"%' for t in tags]
+            siblings = c.execute(
+                f"""SELECT id, tags, importance, emotional, unresolved
+                    FROM narratives
+                    WHERE ({tag_placeholders}) AND id != last_insert_rowid()""",
+                tag_params
+            ).fetchall()
+
+            # Build frequency map for ALL tags (not just this memory's)
+            all_rows = c.execute("SELECT tags FROM narratives WHERE tags IS NOT NULL").fetchall()
+            all_freq = {}
+            for ar in all_rows:
+                try:
+                    for t in json.loads(ar["tags"]):
+                        all_freq[t] = all_freq.get(t, 0) + 1
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            def _rec_from_freq(freq):
+                if freq <= 1: return 1
+                elif freq <= 3: return 2
+                elif freq <= 6: return 3
+                elif freq <= 11: return 4
+                else: return 5
+
+            for sib in siblings:
+                try:
+                    sib_tags = json.loads(sib["tags"])
+                except:
+                    sib_tags = []
+                if not sib_tags:
+                    continue
+                # Max frequency across this sibling's tags
+                sib_max_freq = max(all_freq.get(t, 0) - 1 for t in sib_tags) if sib_tags else 0
+                new_rec = _rec_from_freq(sib_max_freq)
+                new_weight = _compute_weight(sib["importance"], sib["emotional"], new_rec, sib["unresolved"])
+                c.execute(
+                    "UPDATE narratives SET recurrence = ?, weight = ? WHERE id = ?",
+                    (new_rec, new_weight, sib["id"]),
+                )
+            c.commit()
+
         # distribution normalization
         _normalize_weights(c)
         c.commit()
