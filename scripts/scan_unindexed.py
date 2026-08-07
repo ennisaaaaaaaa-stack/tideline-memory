@@ -96,6 +96,19 @@ def scan(since=None, output_format="markdown"):
         (start_ts,)
     ).fetchall()
 
+    # ── Track C: narratives missing embeddings ──
+    no_emb_rows = c.execute(
+        """SELECT id, content, created_at FROM narratives
+           WHERE embedding IS NULL OR embedding = ''
+           ORDER BY created_at ASC"""
+    ).fetchall()
+
+    # ── Track D: context entries missing embeddings ──
+    no_emb_ctx = c.execute(
+        """SELECT COUNT(*) as cnt FROM context
+           WHERE embedding IS NULL OR embedding = ''"""
+    ).fetchone()["cnt"]
+
     # Build conversation chunks from gap_rows
     chunks = _group_chunks(gap_rows)
     total_chunked = sum(len(ch) for ch in chunks)
@@ -107,6 +120,8 @@ def scan(since=None, output_format="markdown"):
             "track_a_empty_source_links": len(no_link_rows),
             "track_b_gap_entries": len(gap_rows),
             "track_b_chunks": len(chunks),
+            "track_c_narratives_missing_embedding": len(no_emb_rows),
+            "track_d_context_missing_embedding": no_emb_ctx,
             "chunks": []
         }
         for i, chunk in enumerate(chunks):
@@ -133,6 +148,22 @@ def scan(since=None, output_format="markdown"):
                 str(r["created_at"])[:19],
                 str(r["content"])[:60]
             ))
+    print()
+
+    # Track C/D: embedding coverage
+    print("## Track C/D: embedding coverage")
+    print("Narratives missing embedding: {}".format(len(no_emb_rows)))
+    print("Context entries missing embedding: {}".format(no_emb_ctx))
+    if no_emb_rows:
+        print("⚠️  These narratives are stored but NOT searchable via semantic retrieval!")
+        for r in no_emb_rows[:5]:
+            print("  [{}] {} | {}".format(
+                r["id"],
+                str(r["created_at"])[:19],
+                str(r["content"])[:60]
+            ))
+        if len(no_emb_rows) > 5:
+            print("  ... and {} more".format(len(no_emb_rows) - 5))
     print()
 
     print("## Track B: timestamp gap scan")
