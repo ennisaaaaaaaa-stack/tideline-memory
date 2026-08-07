@@ -156,19 +156,34 @@ class TidelineMemoryProvider(MemoryProvider):
                     lines.append(f"- {t['content']}{w}")
                 parts.append("\n".join(lines))
 
-            # 4. Prefetch pool (high-weight recent memories)
+            # 4. Prefetch pool (high-weight recent memories, deduplicated by tag)
             pool = c.execute(
-                """SELECT gesture, cognition_direction, weight FROM narratives
+                """SELECT id, gesture, cognition_direction, weight, tags FROM narratives
                    WHERE weight > 0.6
                    AND created_at > datetime('now', '-7 days')
-                   ORDER BY weight DESC LIMIT 3"""
+                   ORDER BY weight DESC LIMIT 10"""
             ).fetchall()
             if pool:
-                lines = ["## 近期高权重记忆\n"]
+                # Deduplicate: keep highest-weight per tag, no tag overlap between slots
+                seen_tags = set()
+                deduped = []
                 for m in pool:
-                    cd = f" → {m['cognition_direction']}" if m["cognition_direction"] else ""
-                    lines.append(f"- {m['gesture']}{cd}")
-                parts.append("\n".join(lines))
+                    try:
+                        m_tags = json.loads(m["tags"]) if m["tags"] else []
+                    except (json.JSONDecodeError, TypeError):
+                        m_tags = []
+                    if m_tags and any(t in seen_tags for t in m_tags):
+                        continue
+                    deduped.append(m)
+                    seen_tags.update(m_tags)
+                    if len(deduped) >= 3:
+                        break
+                if deduped:
+                    lines = ["## 近期高权重记忆\n"]
+                    for m in deduped:
+                        cd = f" → {m['cognition_direction']}" if m["cognition_direction"] else ""
+                        lines.append(f"- {m['gesture']}{cd}")
+                    parts.append("\n".join(lines))
 
             # ── T2b: Context bridge (recent raw conversation chunks) ──
             bridge = self._context_bridge(c)
