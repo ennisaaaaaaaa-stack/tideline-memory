@@ -245,7 +245,8 @@ class TidelineMemoryProvider(MemoryProvider):
                           embedding, tags
                    FROM narratives
                    WHERE gesture IS NOT NULL AND gesture != ''
-                   ORDER BY created_at DESC LIMIT 100"""
+                   AND embedding IS NOT NULL
+                   ORDER BY created_at DESC"""
             ).fetchall()
 
             if not rows:
