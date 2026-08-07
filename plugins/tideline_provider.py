@@ -239,7 +239,7 @@ class TidelineMemoryProvider(MemoryProvider):
                 return ""
 
             c = _db()
-            # Get recent narratives with embeddings
+            # Get all narratives with embeddings
             rows = c.execute(
                 """SELECT id, gesture, context_layer, cognition_direction, weight,
                           embedding, tags
@@ -253,9 +253,20 @@ class TidelineMemoryProvider(MemoryProvider):
                 c.close()
                 return ""
 
+            # ── Adaptive window: cap corpus size for cosine performance ──
+            # Full-scan is O(n). At 294 narratives this is <30ms.
+            # Threshold: if corpus > 2000, only scan recent 2000 (still fast ~200ms)
+            # and inject a notice so it's never silent.
+            SCAN_LIMIT = 2000
+            scan_rows = rows
+            scan_truncated = False
+            if len(rows) > SCAN_LIMIT:
+                scan_rows = rows[:SCAN_LIMIT]
+                scan_truncated = True
+
             import json
             scored = []
-            for r in rows:
+            for r in scan_rows:
                 emb_raw = r["embedding"]
                 if not emb_raw:
                     continue
@@ -295,6 +306,10 @@ class TidelineMemoryProvider(MemoryProvider):
                 cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
                 ctx = f" ({r['context_layer']})" if r["context_layer"] else ""
                 lines.append(f"- {r['gesture']}{cd}{ctx} [sim={sim:.2f}]")
+
+            # Non-silent degradation notice
+            if scan_truncated:
+                lines.append(f"\n⚠️ 语义检索覆盖最近 {SCAN_LIMIT}/{len(rows)} 条记忆，更早的记忆未被扫描。")
 
             c.close()
             result = "\n".join(lines)
