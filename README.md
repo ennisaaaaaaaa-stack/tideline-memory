@@ -113,6 +113,12 @@ The scanner's markdown output feeds into [`prompts/dream_solidify.md`](prompts/d
 | `memory_read_threads` | Browse threads by status |
 | `memory_graph` | Query entity relationship graph (co-occurrence, role pairs) |
 
+### Entity relationship graph
+
+Narratives capture not just *what* happened but *who did what*. The `entities_role` field stores semi-structured role assignments for multi-entity memories (e.g. `A=判断+执行; B=审查`). `build_entity_graph.py` parses these fields to build a co-occurrence graph: how often entities appear together, and in what role-pair patterns.
+
+This graph feeds back into profile precision — when the same entity consistently appears in the same role across memories (e.g. "照照" always = 审查/架构), the system can distinguish entities not just by name but by structural function.
+
 ### Multi-dimensional weight system
 
 Each narrative memory is scored on four dimensions (1-5), combined into a normalized weight:
@@ -125,6 +131,18 @@ Each narrative memory is scored on four dimensions (1-5), combined into a normal
 | unresolved | Is this still open? |
 
 `weight = importance×0.35 + emotional×0.25 + recurrence×0.25 + unresolved×0.15`, normalized to 0-1. Anti-inflation normalization kicks in when recent average exceeds 0.7.
+
+**Recurrence is dynamic, not static.** The recurrence score (1-5) reflects how many *other* narratives share at least one tag with this one — it's locked at write time but goes stale as new memories accumulate. Run `refresh_recurrence` (via the DREAM combing layer or manually) to rescore all narratives based on current tag frequencies:
+
+| Co-occurring narratives | Recurrence score |
+|------------------------|-----------------|
+| 0 | 1 |
+| 1-2 | 2 |
+| 3-5 | 3 |
+| 6-10 | 4 |
+| 11+ | 5 |
+
+Weight is recomputed automatically after recurrence updates.
 
 ### DREAM system
 
@@ -170,6 +188,9 @@ export MEMORY_MCP_DB="/path/to/your/memory.db"
 
 # Agent name (appears in tool descriptions)
 export AGENT_NAME="your-agent"
+
+# Known persons (entities with ongoing relationships — used for entity resolution)
+export KNOWN_PERSONS="Alice,Bob,Carol"
 
 # Embedding (optional but recommended)
 export EMBEDDING_API_KEY="your-key"    # or use local bge-m3
