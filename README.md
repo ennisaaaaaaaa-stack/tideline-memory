@@ -111,6 +111,7 @@ The scanner's markdown output feeds into [`prompts/dream_solidify.md`](prompts/d
 | `memory_read_snapshot` | Read latest state snapshot |
 | `memory_write_thread` | Create exploration thread (DREAM output) |
 | `memory_read_threads` | Browse threads by status |
+| `memory_graph` | Query entity relationship graph (co-occurrence, role pairs) |
 
 ### Multi-dimensional weight system
 
@@ -196,6 +197,7 @@ tideline-memory/
 ├── scripts/
 │   ├── dream_scripts.py       # Deterministic layer: jieba clustering + weight normalization
 │   ├── scan_unindexed.py      # Layer 0: solidification scanner (two-track unindexed detection)
+│   ├── build_entity_graph.py # Entity relationship graph builder (from entities_role)
 │   └── backfill_source_links.py  # Backfill source_links for pre-existing narratives
 ├── prompts/
 │   ├── dream_digest.md        # DREAM layer 1: combing prompt

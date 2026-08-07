@@ -634,6 +634,19 @@ async def list_tools() -> list[types.Tool]:
         },
     ),
 
+    types.Tool(
+        name="memory_graph",
+        description="🕸️ 查询实体关系图谱。看谁和谁在记忆里一起出现过、各自扮演什么角色。",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": "查这个实体的所有关系"},
+                "pair": {"type": "string", "description": "查两个实体的关系（用逗号分隔，如 'A,B'）"},
+                "limit": {"type": "integer", "default": 10},
+            },
+        },
+    ),
+
     ]
 
 
@@ -840,6 +853,70 @@ async def _dispatch(name, a, c):
             if r["explored_at"]:
                 lines.append(f"   explored: {r['explored_at']}")
         return [types.TextContent(type="text", text="\n".join(lines))]
+
+    # ── memory_graph (entity relationship graph) ──
+    if name == "memory_graph":
+        entity = a.get("entity", "")
+        pair = a.get("pair", "")
+        glimit = a.get("limit", 10)
+
+        if pair:
+            # Query relationship between two entities
+            parts = [p.strip() for p in pair.split(",")]
+            if len(parts) == 2:
+                rows = c.execute(
+                    """SELECT n.id, n.gesture, n.created_at, ge.role_a, ge.role_b
+                       FROM graph_edges ge
+                       JOIN narratives n ON n.id = ge.narrative_id
+                       WHERE (ge.entity_a = ? AND ge.entity_b = ?)
+                          OR (ge.entity_a = ? AND ge.entity_b = ?)
+                       ORDER BY n.created_at DESC LIMIT ?""",
+                    (parts[0], parts[1], parts[1], parts[0], glimit),
+                ).fetchall()
+                if not rows:
+                    return [types.TextContent(type="text", text=f"🕸️ {parts[0]} ↔ {parts[1]}：没有找到共同记忆。")]
+                lines = [f"🕸️ {parts[0]} ↔ {parts[1]}（{len(rows)} 条共同记忆）：\n"]
+                for r in rows:
+                    lines.append(f"  #{r['id']} {r['gesture']}")
+                    if r["role_a"]:
+                        lines.append(f"    {parts[0]}: {r['role_a']}")
+                    if r["role_b"]:
+                        lines.append(f"    {parts[1]}: {r['role_b']}")
+                return [types.TextContent(type="text", text="\n".join(lines))]
+
+        elif entity:
+            # Query all relationships for one entity
+            cooccur = c.execute(
+                """SELECT entity_a, entity_b, cooccur_count FROM graph_cooccur
+                   WHERE entity_a = ? OR entity_b = ?
+                   ORDER BY cooccur_count DESC LIMIT ?""",
+                (entity, entity, glimit),
+            ).fetchall()
+            node = c.execute(
+                "SELECT * FROM graph_nodes WHERE entity = ?", (entity,),
+            ).fetchone()
+            if not node and not cooccur:
+                return [types.TextContent(type="text", text=f"🕸️ 没有找到 {entity} 的关系记录。")]
+            lines = [f"🕸️ {entity} 的关系网：\n"]
+            if node:
+                lines.append(f"  提及 {node['mention_count']} 次 | 首次: {node['first_seen'][:10] if node['first_seen'] else '?'} | 最近: {node['last_seen'][:10] if node['last_seen'] else '?'}\n")
+            for cc in cooccur:
+                other = cc["entity_b"] if cc["entity_a"] == entity else cc["entity_a"]
+                lines.append(f"  ↔ {other}（{cc['cooccur_count']} 次共现）")
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        else:
+            # Overview: top nodes
+            rows = c.execute(
+                "SELECT * FROM graph_nodes ORDER BY mention_count DESC LIMIT ?",
+                (glimit,),
+            ).fetchall()
+            if not rows:
+                return [types.TextContent(type="text", text="🕸️ 图谱还是空的。运行 scripts/build_entity_graph.py 构建。")]
+            lines = ["🕸️ 实体图谱概览：\n"]
+            for r in rows:
+                lines.append(f"  {r['entity']}: {r['mention_count']} 次提及")
+            return [types.TextContent(type="text", text="\n".join(lines))]
 
     # ── memory_read_profiles ──
     if name == "memory_read_profiles":
