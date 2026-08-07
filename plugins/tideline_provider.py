@@ -15,6 +15,7 @@ Layers:
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
@@ -160,7 +161,7 @@ class TidelineMemoryProvider(MemoryProvider):
                 """SELECT gesture, cognition_direction, weight FROM narratives
                    WHERE weight > 0.6
                    AND created_at > datetime('now', '-7 days')
-                   ORDER BY weight DESC LIMIT 5"""
+                   ORDER BY weight DESC LIMIT 3"""
             ).fetchall()
             if pool:
                 lines = ["## 近期高权重记忆\n"]
@@ -168,6 +169,11 @@ class TidelineMemoryProvider(MemoryProvider):
                     cd = f" → {m['cognition_direction']}" if m["cognition_direction"] else ""
                     lines.append(f"- {m['gesture']}{cd}")
                 parts.append("\n".join(lines))
+
+            # ── T2b: Context bridge (recent raw conversation chunks) ──
+            bridge = self._context_bridge(c)
+            if bridge:
+                parts.append(bridge)
 
             # ── T3a: Topic map (what themes live in my memory) ──
             topics = c.execute(
@@ -343,6 +349,67 @@ class TidelineMemoryProvider(MemoryProvider):
                 pass
         threading.Thread(target=_bg, daemon=True).start()
 
+    # ═══ T2b: Context Bridge ═══════════════════════════════
+
+    def _context_bridge(self, c, max_chunk=5, max_hours=72) -> str:
+        """Pull recent raw context chunks — the last conversation's texture.
+
+        Strategy:
+        1. Expand window 24h → 48h → 72h until we find context entries.
+        2. Group by session (from meta). Pick the session with highest-weight
+           linked narrative. If no session tags (legacy), treat all as one group.
+        3. Return the latest N chunks from that session, capped at ~2000 tokens.
+        """
+        for hours in range(24, max_hours + 1, 24):
+            rows = c.execute(
+                """SELECT id, content, meta, created_at FROM context
+                   WHERE created_at > datetime('now', ?)
+                   ORDER BY created_at DESC LIMIT 30""",
+                (f"-{hours} hours",),
+            ).fetchall()
+            if rows:
+                break
+        else:
+            return ""
+
+        # Group by session
+        sessions: dict[str, list] = {}
+        for r in rows:
+            try:
+                meta = json.loads(r["meta"]) if r["meta"] else {}
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            sess = meta.get("session", "") or "_legacy"
+            sessions.setdefault(sess, []).append(r)
+
+        # Score each session by max narrative weight (via source_links)
+        best_sess = None
+        best_score = -1
+        for sess, chunk_list in sessions.items():
+            chunk_ids = [str(r["id"]) for r in chunk_list]
+            # Find narratives whose source_links reference any of these chunks
+            linked = c.execute(
+                """SELECT MAX(weight) as w FROM narratives
+                   WHERE source_links LIKE '%' || ? || '%'""",
+                ("|" + "|".join(chunk_ids) + "|",),
+            ).fetchone()
+            score = (linked["w"] or 0) if linked else 0
+            # Newer sessions get slight boost
+            score += 0.01 * len(chunk_list)
+            if score > best_score:
+                best_score = score
+                best_sess = sess
+
+        if not best_sess:
+            return ""
+
+        chunks = sessions[best_sess][-max_chunk:]  # latest N
+        lines = ["## 上下文桥接（最近对话质感）\n"]
+        for chunk in chunks:
+            text = chunk["content"][:400]  # ~200 tokens each
+            lines.append(text)
+        return "\n\n".join(lines)
+
     # ═══ sync_turn (write context) ════════════════════════
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
@@ -350,13 +417,14 @@ class TidelineMemoryProvider(MemoryProvider):
         self._turn_count += 1
         try:
             c = _db()
+            meta = json.dumps({"session": session_id} if session_id else {})
             for role, text in [("USER", user_content), ("ASSISTANT", assistant_content)]:
                 content = f"[{role}] {text[:2000]}"
                 emb = _embed(content[:500])
                 emb_json = json.dumps(emb) if emb else None
                 c.execute(
-                    "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
-                    (content, emb_json, _now()),
+                    "INSERT INTO context (content, embedding, meta, created_at) VALUES (?, ?, ?, ?)",
+                    (content, emb_json, meta, _now()),
                 )
             c.commit()
             c.close()
