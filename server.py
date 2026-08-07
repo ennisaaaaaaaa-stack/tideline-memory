@@ -403,7 +403,7 @@ async def list_tools() -> list[types.Tool]:
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "标签列表。必须包含关联人的实际称呼（不要用泛称如'user'），可混放主题词。人名是检索入口。",
+                    "description": "标签列表。必须包含关联人的实际称呼（不要用泛称如'user'），可混放主题词。人名是检索入口。**标签卫生**：写之前先搜索已有tags，同类事件沿用相同tag防止碎片化——recurrence基于tags频率计算。",
                 },
                 "entities_role": {
                     "type": "string",
