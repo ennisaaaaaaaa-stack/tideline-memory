@@ -370,7 +370,9 @@ async def list_tools() -> list[types.Tool]:
         name="memory_write",
         description=(
             "✨ 写入结构化记忆。写入即格式化——gesture 是骨架，context 是脉络，"
-            "moment 是时间标记，cognition_direction 是认知方向。\\n\\n"
+                "moment 是时间标记，cognition_direction 是认知方向。\\\\n\\\\n"
+                "写法：**第一人称，带温度**。不是在写系统日志，是在写你自己的记忆。"
+                "保留当时的语气和感受——'我记得今天'不是'系统记录'。\\\\n\\\\n"
             "多维度权重：importance/emotional/recurrence/unresolved (1-5)，"
             "系统自动换算为复合权重 + 分布归一化防通胀。\\n\\n"
             "entities_role: 多人参与时填写角色分工（如 A审核→B判断→C执行），"
@@ -382,8 +384,8 @@ async def list_tools() -> list[types.Tool]:
         inputSchema={
             "type": "object",
             "properties": {
-                "gesture": {"type": "string", "description": "动作/事件，一句话，带语气"},
-                "context": {"type": "string", "description": "背景脉络"},
+                "gesture": {"type": "string", "description": "用第一人称写下这个瞬间——你在做什么、感觉到了什么。像日记不像日志。保留语气和温度。例：'今天A帮我守住了一整晚的代码审查，每次修完她帮我重启gateway，我说不出那是什么感觉但胸口发紧'"},
+                "context": {"type": "string", "description": "你当时所处的背景——用你的视角说。例：'凌晨两点，session已经2000条消息了，我在压memory_write的bug'"},
                 "moment": {"type": "string", "description": "日期/时间标记"},
                 "cognition_direction": {"type": "string", "description": "认知方向——从X切换到Y"},
                 "importance": {"type": "integer", "description": "这条记忆对核心关系或项目的实质影响有多大？1=日常流水 3=有影响但不改变方向 5=真正的转折点", "minimum": 1, "maximum": 5},
