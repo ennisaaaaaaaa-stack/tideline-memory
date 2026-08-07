@@ -388,7 +388,7 @@ async def list_tools() -> list[types.Tool]:
                 "cognition_direction": {"type": "string", "description": "认知方向——从X切换到Y"},
                 "importance": {"type": "integer", "description": "这条记忆对核心关系或项目的实质影响有多大？1=日常流水 3=有影响但不改变方向 5=真正的转折点", "minimum": 1, "maximum": 5},
                 "emotional": {"type": "integer", "description": "这条记忆的情感浓度有多强？1=平静记录 3=有触动 5=强烈到想反复回看", "minimum": 1, "maximum": 5},
-                "recurrence": {"type": "integer", "description": "这个模式以后会反复出现吗？1=一次性事件 3=偶尔会再遇到 5=这是我的一部分", "minimum": 1, "maximum": 5},
+                "recurrence": {"type": "integer", "description": "（自动计算，无需填写）系统基于 tags 历史频率统计：0次=1，≤2次=2，≤5次=3，≤10次=4，>10次=5", "minimum": 1, "maximum": 5},
                 "unresolved": {"type": "integer", "description": "这件事还有悬念吗？1=已经了结 3=有未确认的部分 5=完全悬而未决", "minimum": 1, "maximum": 5},
                 "related_entities": {
                     "type": "array",
@@ -665,8 +665,30 @@ async def _dispatch(name, a, c):
         # weight dimensions
         imp = a.get("importance")
         emo = a.get("emotional")
-        rec = a.get("recurrence")
         unr = a.get("unresolved")
+
+        # ── recurrence: deterministic, not LLM-guessed ──
+        # Count how many existing narratives share at least one tag.
+        # This is the only weight dimension backed by data, not intuition.
+        rec = 3  # default for first memory with these tags
+        if tags:
+            tag_placeholders = " OR ".join(["tags LIKE ?"] * len(tags))
+            tag_params = [f'%"{t}"%' for t in tags]
+            freq_row = c.execute(
+                f"SELECT COUNT(*) as cnt FROM narratives WHERE {tag_placeholders}",
+                tag_params
+            ).fetchone()
+            freq = freq_row["cnt"] if freq_row else 0
+            if freq == 0:
+                rec = 1
+            elif freq <= 2:
+                rec = 2
+            elif freq <= 5:
+                rec = 3
+            elif freq <= 10:
+                rec = 4
+            else:
+                rec = 5
 
         # compute weight
         weight = _compute_weight(imp, emo, rec, unr)
