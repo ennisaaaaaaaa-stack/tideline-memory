@@ -251,15 +251,48 @@ tideline-memory/
 ├── scripts/
 │   ├── dream_scripts.py       # Deterministic layer: jieba clustering + weight normalization
 │   ├── scan_unindexed.py      # Layer 0: solidification scanner (two-track unindexed detection)
-│   ├── build_entity_graph.py # Entity relationship graph builder (from entities_role)
+│   ├── build_entity_graph.py  # Entity relationship graph builder (from entities_role)
+│   ├── refresh_recurrence.py  # Recompute recurrence scores from current tag frequencies
 │   └── backfill_source_links.py  # Backfill source_links for pre-existing narratives
 ├── prompts/
 │   ├── dream_digest.md        # DREAM layer 1: combing prompt
 │   ├── dream_sleep.md         # DREAM layer 2-3: night drift + symbolic dream
 │   └── dream_solidify.md      # Layer 0: solidification prompt (reads scanner output)
+├── docs/
+│   ├── configuration-guide.md  # Detailed setup: env vars, embedding, cron, provider plugin
+│   └── who-can-use.txt         # Quick reference: audience tiers + token costs
 ├── LICENSE
 └── README.md
 ```
+
+### File index by layer
+
+| File | Layer | What it does | Needs LLM? | Needs runtime? |
+|------|-------|-------------|------------|----------------|
+| `server.py` | MCP server | 15 memory tools, hybrid search, weight computation | No | Any MCP client |
+| `import_sessions.py` | MCP server | Auto-import raw conversation into context table | No | Cron/scheduled task |
+| `plugins/tideline_provider.py` | Injection (T0-T4) | Auto-inject memory into model context each turn | No | Hermes plugin layer |
+| `scripts/dream_scripts.py` | Script layer | jieba noun extraction, TF-IDF topic clustering, weight normalization, prefetch pool | No | Python 3.12 + jieba |
+| `scripts/scan_unindexed.py` | Layer 0 (solidification) | Detect unindexed conversation context, output markdown for LLM | No | Python 3.12 |
+| `scripts/build_entity_graph.py` | Script layer | Build entity co-occurrence graph from `entities_role` | No | Python 3.12 |
+| `scripts/refresh_recurrence.py` | Script layer | Recompute recurrence scores from current tag frequencies | No | Python 3.12 |
+| `scripts/backfill_source_links.py` | Script layer | One-time: backfill `source_links` for pre-existing narratives | No | Python 3.12 |
+| `prompts/dream_solidify.md` | Layer 0 | Prompt: read scanner output, decide what's worth keeping, write narratives | Yes (in your LLM) | Your runtime's cron |
+| `prompts/dream_digest.md` | DREAM 1 | Prompt: weight re-evaluation, profile updates, conflict detection | Yes (in your LLM) | Your runtime's cron |
+| `prompts/dream_sleep.md` | DREAM 2-3 | Prompt: night drift + symbolic dream generation | Yes (in your LLM) | Your runtime's cron |
+| `docs/configuration-guide.md` | Docs | Full setup guide: env vars, embedding service, cron config, provider plugin | — | — |
+| `docs/who-can-use.txt` | Docs | Quick reference: audience tiers + token cost breakdown | — | — |
+
+### Configuration tiers
+
+| Tier | What you need | What you get | What you skip |
+|------|---------------|-------------|---------------|
+| **Full stack** | server.py + provider plugin + script layer + DREAM cron + embedding | Everything: auto-injection, semantic search, daily consolidation, dreams | — |
+| **MCP + scripts** | server.py + script layer + embedding | Memory tools + semantic search + topic clustering + weights. No auto-injection. | Provider plugin, DREAM cron |
+| **MCP only** | server.py | 15 memory tools, FTS5 keyword search, structured weights. | Provider plugin, scripts, DREAM cron, embedding |
+| **Notebook** | server.py + `memory_search` | Smart structured search over your data. | Everything else |
+
+> **See [`docs/configuration-guide.md`](docs/configuration-guide.md) for detailed setup instructions** — env vars, embedding service setup, cron configuration, and provider plugin wiring.
 
 ## Design decisions worth explaining
 
