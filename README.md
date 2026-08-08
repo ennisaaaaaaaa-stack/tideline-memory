@@ -157,6 +157,39 @@ The DREAM layer runs on a daily cron. Layer 0 (solidification) runs first, then 
 
 Nouns extracted via jieba POS tagging, filtered by document frequency (TF-IDF): words appearing in >20% of memories are auto-removed as generic; words appearing <3 times are filtered as noise. Optional Jaccard co-occurrence merging (disabled by default at small scale).
 
+## Who is this for
+
+| You are... | Fit | How you'd use it |
+|------------|-----|------------------|
+| Running a personal agent (Hermes, Claude Desktop, custom) | ★★★★★ | Full stack: MCP server + provider plugin + DREAM cron. This is what Tideline was built for. |
+| Building agent infrastructure / frameworks | ★★★★☆ | MCP server + script layer. Skip the provider plugin, wire injection into your own runtime. |
+| Experimenting with agent memory | ★★★☆☆ | MCP server only. `pip install mcp`, point at a DB, start writing memories. Embedding optional. |
+| Just want structured memory search | ★★☆☆☆ | MCP server with `memory_search` / `context_search`. Skip DREAM, skip injection. Works as a smart notebook. |
+| Looking for a drop-in RAG solution | ★☆☆☆☆ | Wrong tool. Tideline is memory architecture, not document retrieval. You want sqlite-vec + LangChain. |
+
+**Requirements:** Python 3.11+, SQLite (built-in), optional embedding service. No GPU required (bge-m3 runs on CPU). No cloud required (all data stays local).
+
+## Token cost
+
+Tideline is designed to be cheap to run. Here's the breakdown:
+
+| Component | Token cost | Frequency | Notes |
+|-----------|-----------|-----------|-------|
+| **Injection (T0+T2+T2b+T3)** | ~9,000–11,000 input tokens | Every turn | Replaces what would be manual context-pasting. One-time per turn, not per tool call. |
+| **T1 semantic search** | 0 tokens | Every turn (prefetch) | Pure SQL + cosine. Runs in background thread. |
+| **T4 FTS5 fallback** | 0 tokens | Occasional | Pure SQL. |
+| **Script layer** (clustering, weights, prefetch) | 0 tokens | After each memory_write | All deterministic. |
+| **DREAM Layer 0** (solidification) | ~2,000–5,000 tokens | Daily cron | LLM reads unindexed context, writes structured memories. |
+| **DREAM Layer 1** (combing) | ~3,000–8,000 tokens | Daily cron | LLM re-evaluates weights, updates profiles/self-concept. |
+| **DREAM Layer 2-3** (night drift + dream) | ~2,000–4,000 tokens | Daily cron | LLM generates exploration threads + symbolic dream. |
+| **memory_write** | 0 tokens | As needed | Tool call, no separate LLM call. |
+
+**Daily total:** ~7,000–17,000 tokens for the full DREAM pipeline (once a day). Compare: a single Claude system prompt is ~10,000–15,000 tokens. The injection block is comparable in cost.
+
+**Cost without embedding:** Zero. The server degrades gracefully to FTS5-only mode. You lose semantic matching (synonyms, conceptual similarity) but keep keyword search, structured weights, and all DREAM features.
+
+**Cost without DREAM:** Near-zero ongoing. The MCP server + script layer cost nothing to run. You just miss automated weight management, profile updates, and dream generation. Memories still work — they just don't get "slept on."
+
 ## Quick start
 
 ### Prerequisites
