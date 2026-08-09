@@ -1,0 +1,28 @@
+谁能用
+
+有AI agent的人 → 全功能（记忆+注入+梦境）
+在搭agent框架的 → MCP服务器+脚本层，跳过注入
+想试试agent记忆的 → 只装MCP服务器，embedding可选
+只要结构化搜索的 → 当智能笔记本用
+
+需要什么
+
+Python 3.11+
+SQLite（系统自带）
+不需要GPU
+不需要云服务
+embedding不配也能跑（降级为纯关键词搜索）
+
+Token消耗
+
+日常对话：0（检索和注入都是纯计算）
+每轮注入：约1万token（等同一个system prompt）
+每日梦境：约7千-1.7万token（一天一次）
+不跑梦境：0 ongoing
+
+分级用法
+
+裸装：MCP服务器，关键词搜索，0 token
++embedding：加语义搜索，本地bge-m3，0 token
++注入插件：每轮自动带记忆进上下文，约1万token/轮
++DREAM：每日自动固化+梳理+做梦，7千-1.7万token/天
