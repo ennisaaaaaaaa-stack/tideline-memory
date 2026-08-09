@@ -412,21 +412,34 @@ class TidelineMemoryProvider(MemoryProvider):
                 )
             """)
             
-            # Build cluster lookup from topic_clusters
-            cluster_map = {}
+            # Build cluster lookup from BOTH topic_clusters (jieba) AND emb_cluster_members
+            jieba_map = {}
             rows = c.execute("SELECT cluster_name, narrative_ids FROM topic_clusters").fetchall()
             for r in rows:
                 try:
                     nids = json.loads(r["narrative_ids"])
                     for nid in nids:
-                        cluster_map[nid] = r["cluster_name"]
+                        jieba_map[nid] = r["cluster_name"]
                 except (json.JSONDecodeError, TypeError):
                     pass
+            
+            emb_map = {}
+            try:
+                emb_rows = c.execute("SELECT narrative_id, cluster_id FROM emb_cluster_members").fetchall()
+                for r in emb_rows:
+                    emb_map.setdefault(r["narrative_id"], []).append(r["cluster_id"])
+            except sqlite3.OperationalError:
+                pass  # emb tables not built yet
             
             now = _now()
             for sim, r in scored_results:
                 nid = r["id"]
-                cname = cluster_map.get(nid, "_unclassified")
+                names = []
+                if nid in jieba_map:
+                    names.append(f"jieba:{jieba_map[nid]}")
+                if nid in emb_map:
+                    names.append(f"emb:#{','.join(str(c) for c in emb_map[nid])}")
+                cname = " | ".join(names) if names else "_unclassified"
                 c.execute(
                     "INSERT INTO attention_log (narrative_id, sim, cluster_name, created_at) VALUES (?,?,?,?)",
                     (nid, float(sim), cname, now)
