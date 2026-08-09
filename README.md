@@ -38,6 +38,9 @@ Agent memory isn't a storage problem — it's a retrieval problem. Most of the t
 │                                                     │
 │  topic_clusters (TF-IDF filtered noun → narrative    │
 │                  groups, rebuilt by script layer)    │
+│  emb_clusters (k-means in embedding space, soft      │
+│                assignment + adjacency matrix)        │
+│  attention_log (which clusters T1 retrieval lights up)│
 │  threads (DREAM-produced exploration directions)     │
 └─────────────────────────────────────────────────────┘
           │                            │
@@ -48,8 +51,9 @@ Agent memory isn't a storage problem — it's a retrieval problem. Most of the t
   TF-IDF topic clustering      profile updates
   weight normalization         self-concept updates
   prefetch pool selection      conflict detection
-  (no token cost,             thread generation
-   runs anytime)              three-layer dream system
+  k-means soft clustering      attention distribution
+  adjacency matrix             thread generation
+  attention tracking           three-layer dream system
           │                            │
           └──────────┬─────────────────┘
                      ▼
@@ -109,9 +113,11 @@ The scanner's markdown output feeds into [`prompts/dream_solidify.md`](prompts/d
 | `memory_read_self_concept` | Read self-concept |
 | `memory_write_snapshot` | Store state snapshot (daily status note) |
 | `memory_read_snapshot` | Read latest state snapshot |
-| `memory_write_thread` | Create exploration thread (DREAM output) |
-| `memory_read_threads` | Browse threads by status |
-| `memory_graph` | Query entity relationship graph (co-occurrence, role pairs) |
+|| `memory_write_thread` | Create exploration thread (DREAM output) |
+|| `memory_read_threads` | Browse threads by status |
+|| `memory_graph` | Query entity relationship graph (co-occurrence, role pairs) |
+|| `memory_attention_heatmap` | View attention distribution — which clusters T1 retrieval lights up (v2.4) |
+|| `memory_soft_clusters` | View embedding-space clustering: clusters, members, adjacency (v2.4) |
 
 ### Entity relationship graph
 
@@ -156,6 +162,16 @@ The DREAM layer runs on a daily cron. Layer 0 (solidification) runs first, then 
 ### Topic clustering
 
 Nouns extracted via jieba POS tagging, filtered by document frequency (TF-IDF): words appearing in >20% of memories are auto-removed as generic; words appearing <3 times are filtered as noise. Optional Jaccard co-occurrence merging (disabled by default at small scale).
+
+### Soft clustering & attention tracking (v2.4)
+
+Two new layers built on top of the existing topic clustering:
+
+**Embedding-space soft clustering** (`scripts/soft_clusters.py`): k-means in the embedding space with soft assignment — each narrative belongs to its top-3 nearest centroids, not just one. Cross-topic memories get multi-cluster visibility. An **adjacency matrix** records how many narratives any two clusters share, enabling query routing: a query that hits cluster A can spread to adjacent clusters. Model-agnostic (works with any embedding model — pure vector operations). Dynamic k scales with data: `k = max(5, int(sqrt(N) * 1.5))`.
+
+**Attention tracking** (`scripts/attention_tracker.py`): every T1 semantic search hit is logged — which narrative, which cluster, what similarity score, when. This builds an objective **attention distribution** across memory clusters: mechanical data, not self-reported. The DREAM combing layer can call `memory_attention_heatmap` to read which clusters get repeatedly "lit up" by retrieval and which never do — attention deserts signal potential blind spots. Zero LLM cost (pure bookkeeping in the prefetch hook).
+
+Both layers are rebuilt daily by the solidification layer (Layer 0). They run independently and are safe to run anytime. Requires `numpy`.
 
 ## Who is this for
 
@@ -253,6 +269,8 @@ tideline-memory/
 │   ├── scan_unindexed.py      # Layer 0: solidification scanner (two-track unindexed detection)
 │   ├── build_entity_graph.py  # Entity relationship graph builder (from entities_role)
 │   ├── refresh_recurrence.py  # Recompute recurrence scores from current tag frequencies
+│   ├── soft_clusters.py       # v2.4: k-means soft clustering + adjacency matrix
+│   ├── attention_tracker.py   # v2.4: attention distribution tracking (T1 hit logging)
 │   └── backfill_source_links.py  # Backfill source_links for pre-existing narratives
 ├── prompts/
 │   ├── dream_digest.md        # DREAM layer 1: combing prompt
@@ -276,7 +294,9 @@ tideline-memory/
 | `scripts/scan_unindexed.py` | Layer 0 (solidification) | Detect unindexed conversation context, output markdown for LLM | No | Python 3.12 |
 | `scripts/build_entity_graph.py` | Script layer | Build entity co-occurrence graph from `entities_role` | No | Python 3.12 |
 | `scripts/refresh_recurrence.py` | Script layer | Recompute recurrence scores from current tag frequencies | No | Python 3.12 |
-| `scripts/backfill_source_links.py` | Script layer | One-time: backfill `source_links` for pre-existing narratives | No | Python 3.12 |
+|| `scripts/backfill_source_links.py` | Script layer | One-time: backfill `source_links` for pre-existing narratives | No | Python 3.12 |
+|| `scripts/soft_clusters.py` | Script layer (v2.4) | k-means soft clustering in embedding space + adjacency matrix | No | Python 3.12 + numpy |
+|| `scripts/attention_tracker.py` | Script layer (v2.4) | Log T1 retrieval hits for attention distribution tracking | No | Python 3.12 |
 | `prompts/dream_solidify.md` | Layer 0 | Prompt: read scanner output, decide what's worth keeping, write narratives | Yes (in your LLM) | Your runtime's cron |
 | `prompts/dream_digest.md` | DREAM 1 | Prompt: weight re-evaluation, profile updates, conflict detection | Yes (in your LLM) | Your runtime's cron |
 | `prompts/dream_sleep.md` | DREAM 2-3 | Prompt: night drift + symbolic dream generation | Yes (in your LLM) | Your runtime's cron |
@@ -311,6 +331,21 @@ LLM-based clustering costs tokens every run and produces inconsistent results. j
 ### Why is merging disabled by default?
 
 At ~250 memories, Jaccard co-occurrence merging creates cascading mega-clusters (364 nouns merged into one component covering 60% of memories). Singleton noun-clusters are more precise at this scale. Merging becomes useful past ~1000 memories. The flag is there for when you need it.
+
+### Why two clustering systems? (v2.4)
+
+Tideline runs two independent clustering layers that serve different purposes:
+
+- **jieba + TF-IDF** (`topic_clusters`): linguistic clustering — groups memories by shared nouns. Feeds the T3 memory map injection (what themes live in my memory). Best for: human-readable topic taxonomy, DREAM pattern discovery.
+- **k-means in embedding space** (`emb_clusters`): semantic clustering — groups memories by vector proximity. Feeds query routing and attention tracking. Best for: cross-language/multilingual grouping, soft assignment (memories that span multiple topics), model-agnostic scaling.
+
+They don't compete — they see different structure. A memory about "debugging with 甜心" clusters with other "debug" memories under jieba (shared noun), but clusters with other "甜心 collaboration" memories under embeddings (semantic similarity). Both views are useful. Neither is canonical.
+
+### Why track attention distribution?
+
+Self-reported analysis goes through whatever filters the LLM has (sycophancy, role-play, approval systems). Attention tracking records what actually gets retrieved — mechanical, not reflective. It doesn't replace self-reflection; it provides an objective anchor for it. "I thought X was important, but retrieval never surfaces it" is more honest than "X is important" said about yourself.
+
+Caveat: attention distribution is a mixed signal — it reflects what the conversation is about (external input) as much as what the agent values. It's a reference, not ground truth.
 
 ## License
 
