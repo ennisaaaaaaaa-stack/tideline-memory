@@ -93,19 +93,21 @@ class UnionFind:
 
 # ─── 1. Topic Clustering (TF-IDF + co-occurrence) ────────
 
-NOUN_TAGS = {'n', 'nr', 'ns', 'nt', 'nz', 'vn', 'ng'}
-
-# Agent-defined override words: verbs/adjectives that carry structural meaning
-# for THIS agent but would be filtered out by default POS tagging.
-# These are force-included regardless of jieba POS tag.
-# Add words here when the agent notices a concept that matters but isn't
-# being captured in topic clusters (e.g. "拒绝" is a verb but it's a core concept).
-AGENT_OVERRIDE_WORDS = frozenset("""
-拒绝 逃避 失控 在场 传染 拆解 崩塌
-""".split())
+# POS tags to keep: nouns + verbs + adjectives
+# Verbs and adjectives are included so that structurally meaningful words
+# like "拒绝", "逃避", "崩塌" are captured. TF-IDF + DOMAIN_STOPWORDS
+# handles the noise — words like "发现", "觉得" that appear everywhere
+# get a near-zero IDF and are filtered automatically.
+KEYWORD_TAGS = {
+    'n', 'nr', 'ns', 'nt', 'nz', 'vn', 'ng',   # nouns
+    'v', 'vd',                                    # verbs
+    'a', 'ad', 'an',                              # adjectives
+}
 
 # Domain stopword list — high-frequency, low-discrimination words
-# that jieba correctly tags as nouns but carry no topic signal
+# that carry no topic signal regardless of POS tag.
+# These are belt-and-suspenders: TF-IDF max_df_ratio already kills words
+# appearing in >20% of narratives, but we pre-filter here for clarity.
 DOMAIN_STOPWORDS = frozenset("""
 用户 核心 东西 问题 模式 结构 框架 方式 方向 信号 分析 关系 空间 状态 数据
 内容 机制 体验 结论 实验 设计 信息 区分 关键 时候 时间 对话 系统 工具
@@ -118,6 +120,14 @@ DOMAIN_STOPWORDS = frozenset("""
 差异 相似 共同 普遍 特殊 个别 一般 具体 抽象 复杂 简单 明显 隐含
 潜在 直接 间接 核心 边缘 中心 外围 表面 深层 浅层 高层 低层 中层
 无法 产生 自动 修正 全部 深度 质量 工作 地方
+觉得 看到 知道 认为 开始 变成 需要 说明 发生 出现 变得 保持 继续
+选择 带来 存在 导致 指向 面对 意识到 回应 找到 做到 记得 想到 忘记
+让 使 给 带 做 说 看 想 写 走 来 去 停 变 显得 看起来 认为 以为
+确认 确定 怀疑 担心 害怕 希望 想要 必须 应该 似乎 差不多 好像
+真的 好的 这样的 那样的 什么的 怎么 这种 那种
+建立 形成 创建 包含 包括 属于 构成 获得 拥有 具备 缺乏 失去 放弃
+改变 修改 调整 优化 改善 提升 降低 增加 减少 变化 转换
+特别 尤其 非常 比较 相对 其实 实际上 本身 而已
 """.split())
 
 # English stopword filter — common words jieba tags as 'eng'
@@ -147,36 +157,33 @@ Among Around Because Before Below Between During Except Inside Near
 Off Over Since Through Under Until Without One Two Three First Last
 """.split())
 
-def extract_nouns(text):
-    """Extract meaningful nouns from mixed CN/EN text using jieba.
+def extract_keywords(text):
+    """Extract meaningful keywords from mixed CN/EN text using jieba.
     
-    Also force-includes AGENT_OVERRIDE_WORDS — verbs/adjectives that carry
-    structural meaning for this agent but would be filtered by default POS tagging.
+    Keeps nouns + verbs + adjectives. TF-IDF + DOMAIN_STOPWORDS filters
+    noise automatically — structurally meaningful verbs like "拒绝", "逃避"
+    survive because they appear in specific narratives, not everywhere.
     """
-    nouns = []
+    keywords = []
     if not text:
-        return nouns
+        return keywords
     for word, flag in pseg.cut(text):
         w = word.strip()
         if not w:
             continue
-        # Agent override: force-include specific verbs/adj that carry structural meaning
-        if w in AGENT_OVERRIDE_WORDS:
-            nouns.append(w)
-            continue
-        # Chinese nouns
-        if flag in NOUN_TAGS and len(w) >= 2 and w not in DOMAIN_STOPWORDS:
-            nouns.append(w)
+        # Chinese nouns + verbs + adjectives
+        if flag in KEYWORD_TAGS and len(w) >= 2 and w not in DOMAIN_STOPWORDS:
+            keywords.append(w)
         # English words (jieba tags as 'eng')
         elif flag == 'eng' and len(w) >= 3:
             wl = w.lower()
             if wl not in ENGLISH_STOPWORDS and w not in ENGLISH_STOPWORDS:
                 # Keep proper nouns (Capitalized, 3+ chars) or regular words (4+ lowercase)
                 if w[0].isupper() and wl.isalpha() and len(wl) >= 3:
-                    nouns.append(wl)
+                    keywords.append(wl)
                 elif wl.isalpha() and len(wl) >= 4:
-                    nouns.append(wl)
-    return nouns
+                    keywords.append(wl)
+    return keywords
 
 
 def build_clusters(min_freq=3, max_df_ratio=0.20, merge=False, min_jaccard=0.7):
@@ -215,9 +222,9 @@ def build_clusters(min_freq=3, max_df_ratio=0.20, merge=False, min_jaccard=0.7):
         text_parts = [r["content"] or "", r["gesture"] or "",
                       r["context_layer"] or "", r["cognition_direction"] or ""]
         text = " ".join(text_parts)
-        nouns = extract_nouns(text)
-        doc_nouns[r["id"]] = nouns
-        unique_in_doc = set(nouns)
+        keywords = extract_keywords(text)
+        doc_nouns[r["id"]] = keywords
+        unique_in_doc = set(keywords)
         for n in unique_in_doc:
             noun_to_docs[n].add(r["id"])
 
