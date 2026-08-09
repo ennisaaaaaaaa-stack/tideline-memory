@@ -604,6 +604,37 @@ async def list_tools() -> list[types.Tool]:
     ),
 
     types.Tool(
+        name="memory_attention_heatmap",
+        description=(
+            "👁️ 查看记忆的注意力分布——哪些主题簇在语义检索中被反复照亮，"
+            "哪些从没被命中。纯机械数据不是自我报告。"
+            "DREAM 梳理层用于给 self_reflection 提供客观锚点。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "default": 7, "description": "回看天数"},
+            },
+        },
+    ),
+
+    types.Tool(
+        name="memory_soft_clusters",
+        description=(
+            "🧩 查看 embedding 空间的 soft clustering 结果。"
+            "每条记忆属于 top-3 最近质心，簇间有 adjacency 关系。"
+            "传 cluster_id 查看单个簇的成员和相邻簇。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cluster_id": {"type": "integer", "description": "查看特定簇（可选）"},
+                "report": {"type": "boolean", "default": False, "description": "返回完整报告"},
+            },
+        },
+    ),
+
+    types.Tool(
         name="memory_search",
         description=(
             "🔍 在记忆里搜索。配了 embedding key 时自动用语义搜索，"
@@ -939,6 +970,106 @@ async def _dispatch(name, a, c):
             lines.append(f"#{r['id']} [{r['status']}] {r['content']}{w_str}")
             if r["explored_at"]:
                 lines.append(f"   explored: {r['explored_at']}")
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    # ── memory_attention_heatmap (v2.4) ──
+    if name == "memory_attention_heatmap":
+        days = a.get("days", 7)
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        # Ensure tables exist
+        c.execute("""CREATE TABLE IF NOT EXISTS attention_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            narrative_id INTEGER NOT NULL,
+            sim REAL, cluster_name TEXT,
+            created_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS attention_stats (
+            cluster_name TEXT PRIMARY KEY,
+            hit_count INTEGER DEFAULT 0,
+            last_hit TEXT, last_narrative_id INTEGER)""")
+
+        rows = c.execute("""
+            SELECT cluster_name, COUNT(*) as hits, AVG(sim) as avg_sim, MAX(created_at) as last_seen
+            FROM attention_log WHERE created_at > ?
+            GROUP BY cluster_name ORDER BY hits DESC
+        """, (cutoff,)).fetchall()
+
+        if not rows:
+            return [types.TextContent(type="text",
+                text=f"👁️ 注意力分布（{days}天）\n\n暂无数据。注意力追踪刚启用，需要几轮对话积累。")]
+
+        total = sum(r["hits"] for r in rows)
+        lines = [f"👁️ 注意力分布（{days}天，共{total}次命中）\n"]
+        for r in rows:
+            pct = r["hits"] / total * 100
+            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            avg = f"{r['avg_sim']:.2f}" if r["avg_sim"] else "N/A"
+            lines.append(f"  {r['cluster_name']:20s} {bar} {r['hits']:4d} ({pct:4.1f}%) sim={avg}")
+
+        # Detect deserts
+        all_clusters = c.execute("SELECT cluster_name FROM topic_clusters").fetchall()
+        lit = {r["cluster_name"] for r in rows}
+        deserts = [r[0] for r in all_clusters if r[0] not in lit]
+        if deserts:
+            lines.append(f"\n  ⚠ 从未被照亮: {', '.join(deserts)}")
+
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    # ── memory_soft_clusters (v2.4) ──
+    if name == "memory_soft_clusters":
+        cluster_id = a.get("cluster_id")
+        want_report = a.get("report", False)
+
+        # Ensure tables exist
+        for tbl in ["emb_clusters", "emb_cluster_members", "emb_cluster_adjacency"]:
+            exists = c.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{tbl}'").fetchone()
+            if not exists:
+                return [types.TextContent(type="text",
+                    text="🧩 Soft clustering 尚未构建。运行: python3 scripts/soft_clusters.py build")]
+
+        if cluster_id:
+            # Show single cluster detail
+            cl = c.execute("SELECT * FROM emb_clusters WHERE id=?", (cluster_id,)).fetchone()
+            if not cl:
+                return [types.TextContent(type="text", text=f"🧩 簇 #{cluster_id} 不存在。")]
+            members = c.execute("""
+                SELECT n.id, n.gesture, n.weight, m.distance
+                FROM emb_cluster_members m
+                JOIN narratives n ON n.id = m.narrative_id
+                WHERE m.cluster_id=? ORDER BY m.distance ASC LIMIT 10
+            """, (cluster_id,)).fetchall()
+            neighbors = c.execute("""
+                SELECT cluster_a, cluster_b, shared_count
+                FROM emb_cluster_adjacency
+                WHERE cluster_a=? OR cluster_b=?
+                ORDER BY shared_count DESC LIMIT 5
+            """, (cluster_id, cluster_id)).fetchall()
+            lines = [f"🧩 簇 #{cluster_id}: {cl['name'][:40]}"]
+            lines.append(f"   成员: {cl['member_count']}")
+            lines.append(f"\n   最近成员:")
+            for m in members:
+                lines.append(f"     #{m['id']} (dist={m['distance']:.3f}) {m['gesture'][:40] if m['gesture'] else ''}")
+            if neighbors:
+                lines.append(f"\n   相邻簇:")
+                for n in neighbors:
+                    other = n["cluster_b"] if n["cluster_a"] == cluster_id else n["cluster_a"]
+                    lines.append(f"     → #{other} (shared={n['shared_count']})")
+            return [types.TextContent(type="text", text="\n".join(lines))]
+
+        # Summary report
+        clusters = c.execute("""
+            SELECT ec.id, ec.name, ec.member_count,
+                   (SELECT COUNT(*) FROM emb_cluster_adjacency WHERE cluster_a=ec.id OR cluster_b=ec.id) as adj
+            FROM emb_clusters ec ORDER BY ec.member_count DESC
+        """).fetchall()
+        if not clusters:
+            return [types.TextContent(type="text", text="🧩 尚无 soft cluster 数据。")]
+        lines = [f"🧩 Soft Clusters ({len(clusters)} 簇)\n"]
+        lines.append(f"{'ID':>4} {'成员':>4} {'邻接':>4}  名称")
+        lines.append("-" * 60)
+        for r in clusters:
+            lines.append(f"{r['id']:4d} {r['member_count']:4d} {r['adj']:4d}  {r['name'][:40]}")
         return [types.TextContent(type="text", text="\n".join(lines))]
 
     # ── memory_graph (entity relationship graph) ──
