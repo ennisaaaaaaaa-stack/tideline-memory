@@ -44,8 +44,11 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 def _db():
-    c = sqlite3.connect(DB_PATH)
+    """Safe DB connection with WAL + busy timeout."""
+    c = sqlite3.connect(DB_PATH, timeout=10)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
 
 def init_tables():
@@ -140,8 +143,8 @@ def _kmeans(vectors, k, max_iter=100, seed=42):
             if mask.any():
                 new_centroids[ci] = vectors[mask].mean(axis=0)
         
-        # Check convergence
-        shift = np.abs(new_centroids - centroids).max()
+        # Check convergence via L2 norm of centroid shift
+        shift = np.linalg.norm(new_centroids - centroids)
         centroids = new_centroids
         if shift < 1e-6:
             break
@@ -157,25 +160,23 @@ def _dynamic_k(n_items):
     k = max(5, int(math.sqrt(n_items) * 1.5))
     return min(k, n_items)
 
-def _name_cluster(c, centroid_vec, member_ids, top_k=3):
-    """Name a cluster by finding the highest-weight narratives near its centroid."""
+def _name_cluster(c, centroid_vec, member_ids):
+    """Name a cluster by its highest-weight narrative's gesture."""
     if not member_ids:
         return f"cluster_empty"
     
-    # Get gesture/content for member narratives
     placeholders = ",".join("?" * len(member_ids))
     rows = c.execute(
         f"""SELECT id, gesture, weight FROM narratives 
-            WHERE id IN ({placeholders}) ORDER BY weight DESC LIMIT 5""",
+            WHERE id IN ({placeholders}) ORDER BY weight DESC LIMIT 1""",
         member_ids
     ).fetchall()
     
     if not rows:
         return f"cluster_{len(member_ids)}"
     
-    # Use top-weighted gesture as cluster name
-    names = [r["gesture"][:30] if r["gesture"] else f"narr_{r['id']}" for r in rows[:top_k]]
-    return " / ".join(names)
+    name = rows[0]["gesture"][:25] if rows[0]["gesture"] else f"narr_{rows[0]['id']}"
+    return name
 
 def build_clusters(top_k_assignment=3):
     """Run k-means with soft assignment + build adjacency matrix."""
@@ -295,7 +296,7 @@ def build_clusters(top_k_assignment=3):
     
     c.close()
 
-def query_route(query_text, spread=1):
+def query_route(query_text, spread=1, top_k=3):
     """Test query routing: query → nearest clusters → adjacency spread.
     
     Returns cluster IDs in order of relevance (direct hits first, then spread).
@@ -304,7 +305,7 @@ def query_route(query_text, spread=1):
     
     # Embed query
     from urllib.request import Request, urlopen
-    embed_url = os.environ.get("EMBED_URL", "http://localhost:18001/embed_batch")
+    embed_url = os.environ.get("EMBEDDING_API_URL", os.environ.get("EMBED_URL", "http://localhost:8800/embed_batch"))
     data = json.dumps({"texts": [query_text[:500]]}).encode()
     req = Request(embed_url, data=data, headers={"Content-Type": "application/json"})
     resp = urlopen(req, timeout=10)
@@ -331,7 +332,7 @@ def query_route(query_text, spread=1):
     sims = _cosine_matrix(qvec.reshape(1, -1), cent_vecs)[0]
     
     # Top clusters
-    top_idx = np.argsort(sims)[::-1][:3]
+    top_idx = np.argsort(sims)[::-1][:top_k]
     print(f"Query: '{query_text[:60]}'")
     print(f"\nDirect hits:")
     hit_clusters = set()

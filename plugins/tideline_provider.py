@@ -29,6 +29,21 @@ logger = logging.getLogger(__name__)
 
 import os as _os
 
+import re as _re
+
+def _strip_tags(text: str) -> str:
+    """Remove structured tags like [gesture: xxx], [self_reflection] from injection text.
+
+    Tags are useful for storage/classification but break memory texture on injection.
+    Keeps arrows (→) and natural parentheses — only strips [bracket-tags].
+    """
+    if not text:
+        return text
+    return _re.sub(
+        r'\[(?:gesture|self_reflection|terrain|context|moment|general|insight|observation|reflection)\s*:?\s*[^\]]*\]',
+        '', text, flags=_re.IGNORECASE
+    ).strip()
+
 _DB_PATH = _os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db"))
 _EMBED_URL = _os.environ.get("EMBEDDING_API_URL", "http://127.0.0.1:18001/embed_batch")
 _EMBED_KEY = _os.environ.get("EMBEDDING_API_KEY", "")
@@ -44,10 +59,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(_DB_PATH, timeout=30)
+    c = sqlite3.connect(_DB_PATH, timeout=5)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=30000")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
 
 def _cosine(a: list, b: list) -> float:
@@ -115,6 +130,7 @@ def _extract_conversation(messages: list) -> list:
             continue
 
         content = msg.get("content", "")
+        # Handle content that's a list (multimodal) or string
         if isinstance(content, list):
             text_parts = []
             for part in content:
@@ -130,6 +146,7 @@ def _extract_conversation(messages: list) -> list:
         if len(content) < 10:
             continue
 
+        # Dedup
         key = content[:200]
         if key in seen:
             continue
@@ -138,6 +155,7 @@ def _extract_conversation(messages: list) -> list:
         extracted.append((role.upper(), content))
 
     return extracted
+
 
 # ─── Provider ─────────────────────────────────────────────
 
@@ -215,6 +233,7 @@ class TidelineMemoryProvider(MemoryProvider):
                         m_tags = json.loads(m["tags"]) if m["tags"] else []
                     except (json.JSONDecodeError, TypeError):
                         m_tags = []
+                    # Skip if any of this memory's tags already seen in pool
                     if m_tags and any(t in seen_tags for t in m_tags):
                         continue
                     deduped.append(m)
@@ -224,8 +243,9 @@ class TidelineMemoryProvider(MemoryProvider):
                 if deduped:
                     lines = ["## 近期高权重记忆\n"]
                     for m in deduped:
-                        cd = f" → {m['cognition_direction']}" if m["cognition_direction"] else ""
-                        lines.append(f"- {m['gesture']}{cd}")
+                        g = _strip_tags(m['gesture'])
+                        cd = f" → {_strip_tags(m['cognition_direction'])}" if m["cognition_direction"] else ""
+                        lines.append(f"- {g}{cd}")
                     parts.append("\n".join(lines))
 
             # ── T2b: Context bridge (recent raw conversation chunks) ──
@@ -297,9 +317,6 @@ class TidelineMemoryProvider(MemoryProvider):
                 return ""
 
             # ── Adaptive window: cap corpus size for cosine performance ──
-            # Full-scan is O(n). At 294 narratives this is <30ms.
-            # Threshold: if corpus > 2000, only scan recent 2000 (still fast ~200ms)
-            # and inject a notice so it's never silent.
             SCAN_LIMIT = 2000
             scan_rows = rows
             scan_truncated = False
@@ -307,6 +324,7 @@ class TidelineMemoryProvider(MemoryProvider):
                 scan_rows = rows[:SCAN_LIMIT]
                 scan_truncated = True
 
+            import json
             scored = []
             for r in scan_rows:
                 emb_raw = r["embedding"]
@@ -329,9 +347,9 @@ class TidelineMemoryProvider(MemoryProvider):
                 if t4_results:
                     lines = ["## 相关记忆（auto-recalled）\n"]
                     for sim, r in top:
-                        cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
-                        ctx = f" ({r['context_layer']})" if r["context_layer"] else ""
-                        lines.append(f"- {r['gesture']}{cd}{ctx} [sim={sim:.2f}]")
+                        cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
+                        ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
+                        lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx} [sim={sim:.2f}]")
                     lines.append("\n## 远期记忆（FTS5 fallback）\n")
                     lines.append(t4_results)
                     c.close()
@@ -345,9 +363,9 @@ class TidelineMemoryProvider(MemoryProvider):
 
             lines = ["## 相关记忆（auto-recalled）\n"]
             for sim, r in top:
-                cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
-                ctx = f" ({r['context_layer']})" if r["context_layer"] else ""
-                lines.append(f"- {r['gesture']}{cd}{ctx} [sim={sim:.2f}]")
+                cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
+                ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
+                lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx} [sim={sim:.2f}]")
 
             # Non-silent degradation notice
             if scan_truncated:
@@ -356,11 +374,76 @@ class TidelineMemoryProvider(MemoryProvider):
             c.close()
             result = "\n".join(lines)
             self._prefetch_cache = result
+            
+            # ── Attention tracking: log T1 hits for distribution analysis ──
+            self._log_attention(top)
+            
             return result
 
         except Exception as e:
             logger.warning("Tideline prefetch failed: %s", e)
             return ""
+
+    def _log_attention(self, scored_results):
+        """Log T1 retrieval hits for attention distribution tracking.
+        
+        Called after each successful prefetch. Pure bookkeeping — zero LLM cost.
+        Records which narratives/clusters got "lit up" by semantic search.
+        """
+        if not scored_results:
+            return
+        try:
+            c = _db()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS attention_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    narrative_id INTEGER NOT NULL,
+                    sim REAL,
+                    cluster_name TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS attention_stats (
+                    cluster_name TEXT PRIMARY KEY,
+                    hit_count INTEGER DEFAULT 0,
+                    last_hit TEXT,
+                    last_narrative_id INTEGER
+                )
+            """)
+            
+            # Build cluster lookup from topic_clusters
+            cluster_map = {}
+            rows = c.execute("SELECT cluster_name, narrative_ids FROM topic_clusters").fetchall()
+            for r in rows:
+                try:
+                    nids = json.loads(r["narrative_ids"])
+                    for nid in nids:
+                        cluster_map[nid] = r["cluster_name"]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            now = _now()
+            for sim, r in scored_results:
+                nid = r["id"]
+                cname = cluster_map.get(nid, "_unclassified")
+                c.execute(
+                    "INSERT INTO attention_log (narrative_id, sim, cluster_name, created_at) VALUES (?,?,?,?)",
+                    (nid, float(sim), cname, now)
+                )
+                c.execute("""
+                    INSERT INTO attention_stats (cluster_name, hit_count, last_hit, last_narrative_id)
+                    VALUES (?, 1, ?, ?)
+                    ON CONFLICT(cluster_name) DO UPDATE SET
+                        hit_count = hit_count + 1,
+                        last_hit = excluded.last_hit,
+                        last_narrative_id = excluded.last_narrative_id
+                """, (cname, now, nid))
+            
+            c.commit()
+            c.close()
+        except Exception:
+            pass  # attention tracking should never break prefetch
 
     def _t4_fts_search(self, c, query: str, c_ids: list) -> str:
         """T4: Full-corpus FTS5 keyword search fallback when T1 returns <2 results.
@@ -406,8 +489,8 @@ class TidelineMemoryProvider(MemoryProvider):
         results.sort(key=lambda r: r["weight"] or 0, reverse=True)
         lines = []
         for r in results[:5]:
-            cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
-            lines.append(f"- {r['gesture']}{cd}")
+            cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
+            lines.append(f"- {_strip_tags(r['gesture'])}{cd}")
         return "\n".join(lines)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -429,9 +512,10 @@ class TidelineMemoryProvider(MemoryProvider):
 
         Strategy:
         1. Expand window 24h → 48h → 72h until we find context entries.
-        2. Group by session (from meta). Pick the session with highest-weight
-           linked narrative. If no session tags (legacy), treat all as one group.
-        3. Return the latest N chunks from that session, capped at ~2000 tokens.
+        2. Group by session (from meta). Sort by recency (latest entry).
+           Only use narrative weight as a tiebreaker when sessions overlap
+           in time (within 30 min of each other).
+        3. Return the latest N chunks from the most recent session.
         """
         for hours in range(24, max_hours + 1, 24):
             rows = c.execute(
@@ -445,8 +529,9 @@ class TidelineMemoryProvider(MemoryProvider):
         else:
             return ""
 
-        # Group by session
+        # Group by session, tracking each session's latest timestamp
         sessions: dict[str, list] = {}
+        session_latest: dict[str, str] = {}
         for r in rows:
             try:
                 meta = json.loads(r["meta"]) if r["meta"] else {}
@@ -454,37 +539,37 @@ class TidelineMemoryProvider(MemoryProvider):
                 meta = {}
             sess = meta.get("session", "") or "_legacy"
             sessions.setdefault(sess, []).append(r)
+            ts = r["created_at"] or ""
+            if ts > session_latest.get(sess, ""):
+                session_latest[sess] = ts
 
-        # Score each session by max narrative weight (via source_links)
-        best_sess = None
-        best_score = -1
-        for sess, chunk_list in sessions.items():
+        # Sort sessions: primary = recency (latest entry DESC),
+        # tiebreaker = narrative weight
+        def _sess_weight(cursor, chunk_list):
             chunk_ids = [str(r["id"]) for r in chunk_list]
-            # Find narratives whose source_links reference any of these chunks
-            # source_links is JSON array — use json_each to match chunk IDs
-            placeholders = ",".join("?" * len(chunk_ids))
-            linked = c.execute(
-                f"""SELECT MAX(n.weight) as w FROM narratives n
-                   WHERE EXISTS (
-                       SELECT 1 FROM json_each(n.source_links) je
-                       WHERE CAST(je.value AS TEXT) IN ({placeholders})
-                   )""",
-                chunk_ids,
+            linked = cursor.execute(
+                """SELECT MAX(weight) as w FROM narratives
+                   WHERE source_links LIKE '%' || ? || '%'""",
+                ("|" + "|".join(chunk_ids) + "|",),
             ).fetchone()
-            score = (linked["w"] or 0) if linked else 0
-            # Newer sessions get slight boost
-            score += 0.01 * len(chunk_list)
-            if score > best_score:
-                best_score = score
-                best_sess = sess
+            return (linked["w"] or 0) if linked else 0
+
+        sorted_sessions = sorted(
+            sessions.keys(),
+            key=lambda s: (session_latest.get(s, ""),
+                           _sess_weight(c, sessions[s])),
+            reverse=True,
+        )
+
+        best_sess = sorted_sessions[0] if sorted_sessions else None
 
         if not best_sess:
             return ""
 
-        chunks = sessions[best_sess][-max_chunk:]  # latest N
+        chunks = sessions[best_sess][-max_chunk:]
         lines = ["## 上下文桥接（最近对话质感）\n"]
         for chunk in chunks:
-            text = chunk["content"][:400]  # ~200 tokens each
+            text = chunk["content"][:400]
             lines.append(text)
         return "\n\n".join(lines)
 
@@ -509,10 +594,10 @@ class TidelineMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Tideline sync_turn failed: %s", e)
 
-    # ═══ on_pre_compress (rescue) ═════════════════════════
+    # ═══ on_pre_compress (extract + rescue) ═══════════════
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Before context compression: persist raw messages, then remind.
+        """Before context compression: extract + persist, then remind.
 
         Two things happen here:
         1. Extract user messages and key assistant content from the messages
@@ -530,10 +615,9 @@ class TidelineMemoryProvider(MemoryProvider):
                     content = f"[{role}] {text[:2000]}"
                     emb = _embed(content[:500])
                     emb_json = json.dumps(emb) if emb else None
-                    meta = json.dumps({"source": "pre_compress", "role": role})
                     c.execute(
-                        "INSERT INTO context (content, embedding, meta, created_at) VALUES (?, ?, ?, ?)",
-                        (content, emb_json, meta, _now()),
+                        "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
+                        (content, emb_json, _now()),
                     )
                 c.commit()
                 c.close()
@@ -566,6 +650,50 @@ class TidelineMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Tideline on_pre_compress reminder failed: %s", e)
             return ""
+
+    # ═══ on_session_end (session boundary checkpoint) ═════
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Session boundary checkpoint: persist the full conversation tail.
+
+        Called on /new, /reset, CLI exit, gateway session expiry. Extracts
+        all user messages and substantive assistant responses, writes them
+        to context table with embeddings. This is the safety net that
+        catches anything not already persisted by sync_turn.
+        """
+        try:
+            extracted = _extract_conversation(messages)
+            if not extracted:
+                return
+
+            c = _db()
+            count = 0
+            for role, text in extracted:
+                content = f"[{role}] {text[:2000]}"
+                # Check if already persisted by sync_turn (dedup by content prefix)
+                existing = c.execute(
+                    "SELECT 1 FROM context WHERE content = ? LIMIT 1",
+                    (content,),
+                ).fetchone()
+                if existing:
+                    continue
+                emb = _embed(content[:500])
+                emb_json = json.dumps(emb) if emb else None
+                c.execute(
+                    "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
+                    (content, emb_json, _now()),
+                )
+                count += 1
+            c.commit()
+            c.close()
+
+            if count:
+                logger.info(
+                    "Tideline on_session_end: persisted %d new messages at session boundary",
+                    count,
+                )
+        except Exception as e:
+            logger.debug("Tideline on_session_end failed: %s", e)
 
     # ═══ No tools (MCP server handles interactive) ════════
 
