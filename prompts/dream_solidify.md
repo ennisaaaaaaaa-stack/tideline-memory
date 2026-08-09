@@ -10,10 +10,10 @@
 
 ## 输入
 
-执行脚本获取未索引对话块（在 repo 根目录运行）：
+执行脚本获取未索引对话块：
 
 ```bash
-python3 scripts/scan_unindexed.py
+/usr/bin/python3.12 /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/scan_unindexed.py
 ```
 
 ## 两条 Track
@@ -27,6 +27,7 @@ python3 scripts/scan_unindexed.py
 ## 判断标准：只记你认为值得记的，没有就跳过。同一个对话块可以产出 0-3 条记忆。
 
 ## 写入格式
+
 每条记忆用 `memory_write` 写入：
 
 ```
@@ -34,7 +35,6 @@ gesture: 用一句话描述发生了什么（事件层）
 context_layer: 背景——在哪、什么场景、什么触发了这件事
 moment: 如果有特别值得记住的瞬间——用户说了什么、你观察到什么（引用原话）
 cognition_direction: 你从这件事里看到了什么模式/方向/关联（不是结论是方向）
-related_entities: 涉及的人/概念
 entities_role: 这条记忆的关联人分别扮演了什么角色。注意区分每个角色实际做了什么。多人协作场景（如三角协作链：A审核→B判断+督查→C执行）核实每个行为归属到正确的实体。
 importance: 1-5（1=日常流水，3=有影响，5=转折点）
 emotional: 1-5（1=平静，3=有触动，5=强烈到想反复回看）
@@ -74,3 +74,18 @@ source_links: [56153, 56154, 56155]
 - 独处时间产出的记忆已经是 narrative 格式，跳过
 - cron 偶尔失败时，下次运行会自动补上漏掉的（时间戳兜底）
 - source_links 为空的旧 narrative 由专门的补全分身处理，固化层只管新的
+
+## ⑥ 重建聚类索引（v2.4）
+
+记忆写入完成后，重建两层聚类索引：
+
+```bash
+# jieba noun-frequency 聚类（DREAM层模式发现）
+/usr/bin/python3.12 /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/dream_scripts.py clusters
+
+# embedding-space soft clustering（检索路由 + 注意力追踪）
+/usr/bin/python3.12 /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/soft_clusters.py build
+```
+
+两条都要跑。第一条管 DREAM 梳理层的主题图谱注入，第二条管检索路由和注意力分布。
+如果某条脚本报错，记录错误但不要中断——另一条独立运行。
