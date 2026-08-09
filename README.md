@@ -36,7 +36,7 @@ Agent memory isn't a storage problem — it's a retrieval problem. Most of the t
 │   memories)    sessions +    impression/ terrain/    │
 │                FTS5 index)   relationship) reflection)│
 │                                                     │
-│  topic_clusters (TF-IDF filtered noun → narrative    │
+│  topic_clusters (TF-IDF filtered keyword → narrative │
 │                  groups, rebuilt by script layer)    │
 │  emb_clusters (k-means in embedding space, soft      │
 │                assignment + adjacency matrix)        │
@@ -47,7 +47,7 @@ Agent memory isn't a storage problem — it's a retrieval problem. Most of the t
     SCRIPT LAYER                   DREAM LAYER
    (deterministic)               (LLM, daily cron)
           │                            │
-  jieba noun extraction        weight re-evaluation
+  jieba keyword extraction       weight re-evaluation
   TF-IDF topic clustering      profile updates
   weight normalization         self-concept updates
   prefetch pool selection      conflict detection
@@ -161,7 +161,7 @@ The DREAM layer runs on a daily cron. Layer 0 (solidification) runs first, then 
 
 ### Topic clustering
 
-Nouns extracted via jieba POS tagging, filtered by document frequency (TF-IDF): words appearing in >20% of memories are auto-removed as generic; words appearing <3 times are filtered as noise. Optional Jaccard co-occurrence merging (disabled by default at small scale).
+**Keywords** (nouns + verbs + adjectives) extracted via jieba POS tagging, then filtered by document frequency (TF-IDF): words appearing in >20% of memories are auto-removed as generic; words appearing <3 times are filtered as noise. Including verbs and adjectives means structurally meaningful words like "拒绝" (refuse) or "逃避" (escape) are captured automatically — TF-IDF handles the noise without any agent intervention. Optional Jaccard co-occurrence merging (disabled by default at small scale).
 
 ### Soft clustering & attention tracking (v2.4)
 
@@ -290,7 +290,7 @@ tideline-memory/
 | `server.py` | MCP server | 15 memory tools, hybrid search, weight computation | No | Any MCP client |
 | `import_sessions.py` | MCP server | Auto-import raw conversation into context table | No | Cron/scheduled task |
 | `plugins/tideline_provider.py` | Injection (T0-T4) | Auto-inject memory into model context each turn | No | Hermes plugin layer |
-| `scripts/dream_scripts.py` | Script layer | jieba noun extraction, TF-IDF topic clustering, weight normalization, prefetch pool | No | Python 3.12 + jieba |
+| `scripts/dream_scripts.py` | Script layer | jieba keyword extraction (nouns+verbs+adj), TF-IDF topic clustering, weight normalization, prefetch pool | No | Python 3.12 + jieba |
 | `scripts/scan_unindexed.py` | Layer 0 (solidification) | Detect unindexed conversation context, output markdown for LLM | No | Python 3.12 |
 | `scripts/build_entity_graph.py` | Script layer | Build entity co-occurrence graph from `entities_role` | No | Python 3.12 |
 | `scripts/refresh_recurrence.py` | Script layer | Recompute recurrence scores from current tag frequencies | No | Python 3.12 |
@@ -326,7 +326,9 @@ Free-text memories are easy to write but hard to reason about. "What was the emo
 
 ### Why jieba + TF-IDF instead of LLM-based topic modeling?
 
-LLM-based clustering costs tokens every run and produces inconsistent results. jieba + TF-IDF is deterministic, zero-cost, and runs in seconds. The trade-off is coarser clustering, but for agent memory (not academic NLP), precision matters more than elegance. Each surviving noun is a precise topic tag — "边界" hits exactly 28 relevant memories, no ambiguity.
+LLM-based clustering costs tokens every run and produces inconsistent results. jieba + TF-IDF is deterministic, zero-cost, and runs in seconds. The trade-off is coarser clustering, but for agent memory (not academic NLP), precision matters more than elegance. Each surviving keyword is a precise topic tag — "边界" hits exactly 28 relevant memories, no ambiguity.
+
+Why include verbs and adjectives, not just nouns? Because structural verbs like "拒绝" (refuse), "逃避" (escape), or "失控" (lose control) carry more topic signal than generic nouns like "问题" or "过程". TF-IDF filters noise automatically — words that appear everywhere get near-zero IDF. No agent intervention needed.
 
 ### Why is merging disabled by default?
 
