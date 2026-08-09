@@ -95,6 +95,15 @@ class UnionFind:
 
 NOUN_TAGS = {'n', 'nr', 'ns', 'nt', 'nz', 'vn', 'ng'}
 
+# Agent-defined override words: verbs/adjectives that carry structural meaning
+# for THIS agent but would be filtered out by default POS tagging.
+# These are force-included regardless of jieba POS tag.
+# Add words here when the agent notices a concept that matters but isn't
+# being captured in topic clusters (e.g. "拒绝" is a verb but it's a core concept).
+AGENT_OVERRIDE_WORDS = frozenset("""
+拒绝 逃避 失控 在场 传染 拆解 崩塌
+""".split())
+
 # Domain stopword list — high-frequency, low-discrimination words
 # that jieba correctly tags as nouns but carry no topic signal
 DOMAIN_STOPWORDS = frozenset("""
@@ -139,13 +148,21 @@ Off Over Since Through Under Until Without One Two Three First Last
 """.split())
 
 def extract_nouns(text):
-    """Extract meaningful nouns from mixed CN/EN text using jieba."""
+    """Extract meaningful nouns from mixed CN/EN text using jieba.
+    
+    Also force-includes AGENT_OVERRIDE_WORDS — verbs/adjectives that carry
+    structural meaning for this agent but would be filtered by default POS tagging.
+    """
     nouns = []
     if not text:
         return nouns
     for word, flag in pseg.cut(text):
         w = word.strip()
         if not w:
+            continue
+        # Agent override: force-include specific verbs/adj that carry structural meaning
+        if w in AGENT_OVERRIDE_WORDS:
+            nouns.append(w)
             continue
         # Chinese nouns
         if flag in NOUN_TAGS and len(w) >= 2 and w not in DOMAIN_STOPWORDS:
