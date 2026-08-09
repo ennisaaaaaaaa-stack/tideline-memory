@@ -30,9 +30,17 @@ DB_PATH = os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memo
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
+def _db():
+    """Safe DB connection with WAL + busy timeout."""
+    c = sqlite3.connect(DB_PATH, timeout=10)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
+    return c
+
 def init_tables():
     """Create attention tracking tables. Idempotent."""
-    c = sqlite3.connect(DB_PATH)
+    c = _db()
     c.execute("""
         CREATE TABLE IF NOT EXISTS attention_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,26 +67,45 @@ def init_tables():
 def log_hits(narrative_ids, sim_scores, cluster_map=None):
     """Log T1 retrieval hits. Called after each prefetch().
     
+    Records cluster_name from BOTH topic_clusters (jieba) AND emb_clusters (embedding).
+    Format: "jieba:session" or "emb:#3" to distinguish the two layers.
+    
     Args:
         narrative_ids: list of narrative IDs that were retrieved
         sim_scores: list of similarity scores (same order)
         cluster_map: optional dict {narrative_id: cluster_name}
-                     If None, tries to look up from topic_clusters.
+                     If None, looks up from both topic_clusters and emb_cluster_members.
     """
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
+    c = _db()
 
-    # If no cluster_map provided, build one from topic_clusters
     if cluster_map is None:
-        cluster_map = {}
+        # Build jieba cluster map
+        jieba_map = {}
         rows = c.execute("SELECT cluster_name, narrative_ids FROM topic_clusters").fetchall()
         for r in rows:
             try:
                 nids = json.loads(r["narrative_ids"])
                 for nid in nids:
-                    cluster_map[nid] = r["cluster_name"]
+                    jieba_map[nid] = r["cluster_name"]
             except (json.JSONDecodeError, TypeError):
                 pass
+        
+        # Build emb cluster map
+        emb_map = {}
+        rows = c.execute("""
+            SELECT narrative_id, cluster_id FROM emb_cluster_members
+        """).fetchall()
+        for r in rows:
+            emb_map.setdefault(r["narrative_id"], []).append(r["cluster_id"])
+        
+        cluster_map = {}
+        for nid in narrative_ids:
+            names = []
+            if nid in jieba_map:
+                names.append(f"jieba:{jieba_map[nid]}")
+            if nid in emb_map:
+                names.append(f"emb:#{','.join(str(c) for c in emb_map[nid])}")
+            cluster_map[nid] = " | ".join(names) if names else "_unclassified"
 
     now = _now()
     for nid, sim in zip(narrative_ids, sim_scores):
@@ -87,7 +114,6 @@ def log_hits(narrative_ids, sim_scores, cluster_map=None):
             "INSERT INTO attention_log (narrative_id, sim, cluster_name, created_at) VALUES (?,?,?,?)",
             (nid, sim, cname, now)
         )
-        # Update stats
         c.execute("""
             INSERT INTO attention_stats (cluster_name, hit_count, last_hit, last_narrative_id)
             VALUES (?, 1, ?, ?)
@@ -102,8 +128,7 @@ def log_hits(narrative_ids, sim_scores, cluster_map=None):
 
 def get_stats(days=7):
     """Return attention distribution for the last N days."""
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
+    c = _db()
     
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     
@@ -137,7 +162,7 @@ def format_heatmap(days=7):
         lines.append(f"  {s['cluster_name']:20s} {bar} {s['hits']:4d}次 ({pct:4.1f}%) avg_sim={avg_sim}")
     
     # Detect attention deserts (clusters in topic_clusters with 0 hits)
-    c = sqlite3.connect(DB_PATH)
+    c = _db()
     all_clusters = c.execute("SELECT cluster_name FROM topic_clusters").fetchall()
     c.close()
     lit = {s["cluster_name"] for s in stats}
@@ -163,7 +188,8 @@ if __name__ == "__main__":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
         stats = get_stats(days)
         for s in stats:
-            print(f"  {s['cluster_name']:20s} {s['hits']:4d} hits  avg_sim={s['avg_sim']:.2f if s['avg_sim'] else 0:.2f}")
+            avg = s['avg_sim'] if s['avg_sim'] else 0
+            print(f"  {s['cluster_name']:20s} {s['hits']:4d} hits  avg_sim={avg:.2f}")
     elif cmd == "heatmap":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
         print(format_heatmap(days))
