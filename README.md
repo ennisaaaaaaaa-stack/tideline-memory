@@ -1,6 +1,6 @@
 # Tideline 潮痕
 
-A memory architecture for AI agents that thinks about memory the way tides think about the shore — everything that washes in is preserved; what matters is what gets left behind when the water recedes.
+A long-term memory architecture for AI agents. Most agent memory works like a search engine — you ask, it finds. Tideline is different: the agent wakes up already knowing who it is, not querying "who am I?" every session. Accurate retrieval at any scale. No compression, no forgetting.
 
 Built as an [MCP server](https://modelcontextprotocol.io) with a deterministic script layer (no LLM, no token cost) and an optional DREAM layer (LLM-driven consolidation). Designed for [Hermes Agent](https://hermes-agent.nousresearch.com) but works with any MCP-compatible runtime.
 
@@ -113,11 +113,11 @@ The scanner's markdown output feeds into [`prompts/dream_solidify.md`](prompts/d
 | `memory_read_self_concept` | Read self-concept |
 | `memory_write_snapshot` | Store state snapshot (daily status note) |
 | `memory_read_snapshot` | Read latest state snapshot |
-|| `memory_write_thread` | Create exploration thread (DREAM output) |
-|| `memory_read_threads` | Browse threads by status |
-|| `memory_graph` | Query entity relationship graph (co-occurrence, role pairs) |
-|| `memory_attention_heatmap` | View attention distribution — which clusters T1 retrieval lights up (v2.4) |
-|| `memory_soft_clusters` | View embedding-space clustering: clusters, members, adjacency (v2.4) |
+| `memory_write_thread` | Create exploration thread (DREAM output) |
+| `memory_read_threads` | Browse threads by status |
+| `memory_graph` | Query entity relationship graph (co-occurrence, role pairs) |
+| `memory_attention_heatmap` | View attention distribution — which clusters T1 retrieval lights up (v2.4) |
+| `memory_soft_clusters` | View embedding-space clustering: clusters, members, adjacency (v2.4) |
 
 ### Entity relationship graph
 
@@ -294,9 +294,9 @@ tideline-memory/
 | `scripts/scan_unindexed.py` | Layer 0 (solidification) | Detect unindexed conversation context, output markdown for LLM | No | Python 3.12 |
 | `scripts/build_entity_graph.py` | Script layer | Build entity co-occurrence graph from `entities_role` | No | Python 3.12 |
 | `scripts/refresh_recurrence.py` | Script layer | Recompute recurrence scores from current tag frequencies | No | Python 3.12 |
-|| `scripts/backfill_source_links.py` | Script layer | One-time: backfill `source_links` for pre-existing narratives | No | Python 3.12 |
-|| `scripts/soft_clusters.py` | Script layer (v2.4) | k-means soft clustering in embedding space + adjacency matrix | No | Python 3.12 + numpy |
-|| `scripts/attention_tracker.py` | Script layer (v2.4) | Log T1 retrieval hits for attention distribution tracking | No | Python 3.12 |
+| `scripts/backfill_source_links.py` | Script layer | One-time: backfill `source_links` for pre-existing narratives | No | Python 3.12 |
+| `scripts/soft_clusters.py` | Script layer (v2.4) | k-means soft clustering in embedding space + adjacency matrix | No | Python 3.12 + numpy |
+| `scripts/attention_tracker.py` | Script layer (v2.4) | Log T1 retrieval hits for attention distribution tracking | No | Python 3.12 |
 | `prompts/dream_solidify.md` | Layer 0 | Prompt: read scanner output, decide what's worth keeping, write narratives | Yes (in your LLM) | Your runtime's cron |
 | `prompts/dream_digest.md` | DREAM 1 | Prompt: weight re-evaluation, profile updates, conflict detection | Yes (in your LLM) | Your runtime's cron |
 | `prompts/dream_sleep.md` | DREAM 2-3 | Prompt: night drift + symbolic dream generation | Yes (in your LLM) | Your runtime's cron |
