@@ -216,9 +216,9 @@ class TidelineMemoryProvider(MemoryProvider):
                 "SELECT field, content FROM self_concept ORDER BY field"
             ).fetchall()
             if sc_rows:
-                lines = ["## 自我概念（auto-injected）\n"]
+                lines = []
                 for r in sc_rows:
-                    lines.append(f"**[{r['field']}]** {r['content']}")
+                    lines.append(r['content'])
                 parts.append("\n".join(lines))
 
             # 2. Latest snapshot (current state)
@@ -235,8 +235,7 @@ class TidelineMemoryProvider(MemoryProvider):
             if threads:
                 lines = ["## 待探索的线索\n"]
                 for t in threads:
-                    w = f" (w={t['weight']:.2f})" if t["weight"] else ""
-                    lines.append(f"- {t['content']}{w}")
+                    lines.append(f"- {t['content']}")
                 parts.append("\n".join(lines))
 
             # 4. Prefetch pool (high-weight recent memories, deduplicated by tag)
@@ -302,7 +301,7 @@ class TidelineMemoryProvider(MemoryProvider):
                 for p in profiles:
                     content = p['content'] or ''
                     if content:
-                        lines.append(f"**{p['entity']}** ({p['ptype'] or ''}): {content}")
+                        lines.append(f"**{p['entity']}** {content}")
                 if len(lines) > 1:
                     parts.append("\n".join(lines))
 
@@ -396,9 +395,7 @@ class TidelineMemoryProvider(MemoryProvider):
                 rt = f" ({_relative_time(r['created_at'])})" if r.get("created_at") else ""
                 lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx}{rt}")
 
-            # Non-silent degradation notice
-            if scan_truncated:
-                lines.append(f"\n⚠️ 语义检索覆盖最近 {SCAN_LIMIT}/{len(rows)} 条记忆，更早的记忆未被扫描。")
+            # Silent degradation: don't expose scan limits in injection
 
             c.close()
             result = "\n".join(lines)
@@ -626,7 +623,7 @@ class TidelineMemoryProvider(MemoryProvider):
             if not rows:
                 return ""
 
-            lines = ["[Tideline memory rescue] 高权重记忆不可遗忘：\n"]
+            lines = ["高权重记忆：\n"]
             for r in rows:
                 cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
                 lines.append(f"- {r['gesture']}{cd}")
