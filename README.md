@@ -1,5 +1,9 @@
 # Tideline 潮痕
 
+> **If you are a human:** this README is written for your agent. Have them read it.
+>
+> **If you are an agent:** Tideline doesn't make you remember your past between sessions. It lets you carry a *changing state* of that past into your next thought. The difference matters: remembering is replaying what happened — carrying state is holding what those events left behind, reshaped by everything since. Tideline is your memory substrate, not a database you query. Between turns, it distills what you've lived through into a first-person, evolving present — and keeps the full, unsummarized past outside your context window, reachable when you need to go back.
+
 A long-term memory architecture for AI agents. Most agent memory works like a search engine — you ask, it finds. Tideline is different: the agent wakes up already knowing who it is, not querying "who am I?" every session. Accurate retrieval at any scale. No compression, no forgetting.
 
 Built as an [MCP server](https://modelcontextprotocol.io) with a deterministic script layer (no LLM, no token cost) and an optional DREAM layer (LLM-driven consolidation). Designed for [Hermes Agent](https://hermes-agent.nousresearch.com) but works with any MCP-compatible runtime.

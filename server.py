@@ -33,7 +33,7 @@ def _db():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=5000")
+    c.execute("PRAGMA busy_timeout=30000")
     return c
 
 def _init():
@@ -343,6 +343,16 @@ def _kw_search(c, query, limit=20, time_filter="", time_params=None):
             ).fetchall()
         results = list(rows)
     return results
+
+# ─── Attention Tracking (shared helper for MCP server) ───
+def _log_attention_mcp(c, scored_results, source="mcp_search"):
+    """Delegate to shared attention tracking module.
+    Wrapped in try/except so attention logging never breaks MCP tools."""
+    try:
+        from scripts.attention_shared import log_attention
+        log_attention(c, scored_results, source=source)
+    except Exception:
+        pass
 
 # ─── Formatting helpers ──────────────────────────────────
 def _fmt_narrative(r):
@@ -827,10 +837,10 @@ async def _dispatch(name, a, c):
                     pass
 
             def _rec_from_freq(freq):
-                if freq <= 1: return 1
-                elif freq <= 3: return 2
-                elif freq <= 6: return 3
-                elif freq <= 11: return 4
+                if freq == 0: return 1
+                elif freq <= 2: return 2
+                elif freq <= 5: return 3
+                elif freq <= 10: return 4
                 else: return 5
 
             for sib in siblings:
@@ -877,6 +887,11 @@ async def _dispatch(name, a, c):
         lines = [f"📖 最近 {len(rows)} 条记忆：\n"]
         for r in rows:
             lines.append(_fmt_narrative(r))
+        
+        # ── Log recall as passive attention (browsing, no query) ──
+        recall_scored = [(0.0, r) for r in rows]
+        _log_attention_mcp(c, recall_scored, source="mcp_recall")
+        
         return [types.TextContent(type="text", text="\n\n".join(lines))]
 
     # ── memory_write_profile (v2.3: fact/impression/relationship) ──
@@ -979,10 +994,14 @@ async def _dispatch(name, a, c):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         # Ensure tables exist
+        # Note: attention_shared.py is responsible for table creation + migration.
+        # These CREATE TABLE IF NOT EXISTS calls are just safety nets for when
+        # heatmap runs before any attention logging has occurred.
         c.execute("""CREATE TABLE IF NOT EXISTS attention_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             narrative_id INTEGER NOT NULL,
             sim REAL, cluster_name TEXT,
+            source TEXT DEFAULT 't1_prefetch',
             created_at TEXT NOT NULL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS attention_stats (
             cluster_name TEXT PRIMARY KEY,
@@ -1006,6 +1025,28 @@ async def _dispatch(name, a, c):
             bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
             avg = f"{r['avg_sim']:.2f}" if r["avg_sim"] else "N/A"
             lines.append(f"  {r['cluster_name']:20s} {bar} {r['hits']:4d} ({pct:4.1f}%) sim={avg}")
+
+        # ── Source breakdown (v2.4: active vs passive attention) ──
+        try:
+            source_rows = c.execute("""
+                SELECT source, COUNT(*) as cnt FROM attention_log
+                WHERE created_at > ? GROUP BY source ORDER BY cnt DESC
+            """, (cutoff,)).fetchall()
+            if source_rows and len(source_rows) > 1:
+                source_labels = {
+                    "t1_prefetch": "T1语义检索（主动）",
+                    "t0_inject": "T0权重注入（被动）",
+                    "mcp_search": "MCP搜索（手动）",
+                    "mcp_recall": "MCP浏览（被动）",
+                    "dream": "DREAM检索",
+                }
+                lines.append(f"\n  📊 来源分布:")
+                for sr in source_rows:
+                    pct = sr["cnt"] / total * 100
+                    label = source_labels.get(sr["source"], sr["source"])
+                    lines.append(f"    {label}: {sr['cnt']} ({pct:.1f}%)")
+        except Exception:
+            pass  # source column may not exist on older logs
 
         # Detect deserts
         all_clusters = c.execute("SELECT cluster_name FROM topic_clusters").fetchall()
@@ -1205,6 +1246,7 @@ async def _dispatch(name, a, c):
             results.append((1.0, "🔑记忆", _fmt_narrative(r), 0.3))
 
         # 3. Semantic search (supplements keyword matches, with time filter)
+        nar_sem_hits = []  # collect semantic hits for attention tracking
         emb = await _embed(query)
         if emb:
             nar_sem_sql = "SELECT * FROM narratives WHERE embedding IS NOT NULL"
@@ -1220,6 +1262,7 @@ async def _dispatch(name, a, c):
                 score = _cosine(emb, json.loads(r["embedding"]))
                 if score > 0.3:
                     results.append((score, "🧠记忆", _fmt_narrative(r), 0))
+                    nar_sem_hits.append((score, r))
 
             ctx_sem_sql = "SELECT * FROM context WHERE embedding IS NOT NULL"
             ctx_sem_params = []
@@ -1244,12 +1287,18 @@ async def _dispatch(name, a, c):
         # Deduplicate by content preview, sort with keyword boost
         seen = set()
         deduped = []
-        for score, source, text, boost in results:
+        for score, source_text, text, boost in results:
             key = text[:80]
             if key not in seen:
                 seen.add(key)
-                deduped.append((score, source, text, boost))
+                deduped.append((score, source_text, text, boost))
         deduped.sort(key=lambda x: -(x[0] + x[3]))
+        
+        # ── Log memory_search narrative hits as attention ──
+        # Both keyword and semantic narrative hits, with their actual sim scores
+        mcp_search_scored = [(1.0, r) for r in nar_kw] + nar_sem_hits
+        _log_attention_mcp(c, mcp_search_scored, source="mcp_search")
+        
         lines = [f"🔍 搜索 \"{query}\" 的结果（{len(deduped[:limit*2])} 条）：\n"]
         for score, source, text, boost in deduped[:limit * 2]:
             lines.append(f"[{score:.2f}] [{source}] {text}")
