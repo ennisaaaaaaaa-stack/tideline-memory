@@ -332,7 +332,7 @@ class TidelineMemoryProvider(MemoryProvider):
             # Get all narratives with embeddings
             rows = c.execute(
                 """SELECT id, gesture, context_layer, cognition_direction, weight,
-                          embedding, tags
+                          embedding, tags, created_at
                    FROM narratives
                    WHERE gesture IS NOT NULL AND gesture != ''
                    AND embedding IS NOT NULL
@@ -375,7 +375,7 @@ class TidelineMemoryProvider(MemoryProvider):
                     for sim, r in top:
                         cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
                         ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
-                        rt = f" ({_relative_time(r['created_at'])})" if r.get("created_at") else ""
+                        rt = f" ({_relative_time(r['created_at'])})" if r["created_at"] else ""
                         lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx}{rt}")
                     lines.append("\n## 远期记忆（FTS5 fallback）\n")
                     lines.append(t4_results)
@@ -392,7 +392,7 @@ class TidelineMemoryProvider(MemoryProvider):
             for sim, r in top:
                 cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
                 ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
-                rt = f" ({_relative_time(r['created_at'])})" if r.get("created_at") else ""
+                rt = f" ({_relative_time(r['created_at'])})" if r["created_at"] else ""
                 lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx}{rt}")
 
             # Silent degradation: don't expose scan limits in injection
