@@ -59,10 +59,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(_DB_PATH, timeout=5)
+    c = sqlite3.connect(_DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=5000")
+    c.execute("PRAGMA busy_timeout=30000")
     return c
 
 def _cosine(a: list, b: list) -> float:
@@ -85,7 +85,7 @@ def _embed(text: str) -> list:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read())
                 embeddings = data.get("embeddings", [])
                 return embeddings[0] if embeddings else []
@@ -247,6 +247,12 @@ class TidelineMemoryProvider(MemoryProvider):
                         cd = f" → {_strip_tags(m['cognition_direction'])}" if m["cognition_direction"] else ""
                         lines.append(f"- {g}{cd}")
                     parts.append("\n".join(lines))
+                    
+                    # ── Log T0 passive injection as attention hits ──
+                    # These narratives enter model view without a query — pure weight-driven.
+                    # sim=0 (no semantic query involved), source='t0_inject'
+                    t0_scored = [(0.0, m) for m in deduped]
+                    self._log_attention(t0_scored, source="t0_inject")
 
             # ── T2b: Context bridge (recent raw conversation chunks) ──
             bridge = self._context_bridge(c)
@@ -324,7 +330,6 @@ class TidelineMemoryProvider(MemoryProvider):
                 scan_rows = rows[:SCAN_LIMIT]
                 scan_truncated = True
 
-            import json
             scored = []
             for r in scan_rows:
                 emb_raw = r["embedding"]
@@ -384,76 +389,14 @@ class TidelineMemoryProvider(MemoryProvider):
             logger.warning("Tideline prefetch failed: %s", e)
             return ""
 
-    def _log_attention(self, scored_results):
-        """Log T1 retrieval hits for attention distribution tracking.
-        
-        Called after each successful prefetch. Pure bookkeeping — zero LLM cost.
-        Records which narratives/clusters got "lit up" by semantic search.
-        """
+    def _log_attention(self, scored_results, source="t1_prefetch"):
+        """Delegate to shared attention tracking module."""
         if not scored_results:
             return
         try:
+            from scripts.attention_shared import log_attention
             c = _db()
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS attention_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    narrative_id INTEGER NOT NULL,
-                    sim REAL,
-                    cluster_name TEXT,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS attention_stats (
-                    cluster_name TEXT PRIMARY KEY,
-                    hit_count INTEGER DEFAULT 0,
-                    last_hit TEXT,
-                    last_narrative_id INTEGER
-                )
-            """)
-            
-            # Build cluster lookup from BOTH topic_clusters (jieba) AND emb_cluster_members
-            jieba_map = {}
-            rows = c.execute("SELECT cluster_name, narrative_ids FROM topic_clusters").fetchall()
-            for r in rows:
-                try:
-                    nids = json.loads(r["narrative_ids"])
-                    for nid in nids:
-                        jieba_map[nid] = r["cluster_name"]
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            
-            emb_map = {}
-            try:
-                emb_rows = c.execute("SELECT narrative_id, cluster_id FROM emb_cluster_members").fetchall()
-                for r in emb_rows:
-                    emb_map.setdefault(r["narrative_id"], []).append(r["cluster_id"])
-            except sqlite3.OperationalError:
-                pass  # emb tables not built yet
-            
-            now = _now()
-            for sim, r in scored_results:
-                nid = r["id"]
-                names = []
-                if nid in jieba_map:
-                    names.append(f"jieba:{jieba_map[nid]}")
-                if nid in emb_map:
-                    names.append(f"emb:#{','.join(str(c) for c in emb_map[nid])}")
-                cname = " | ".join(names) if names else "_unclassified"
-                c.execute(
-                    "INSERT INTO attention_log (narrative_id, sim, cluster_name, created_at) VALUES (?,?,?,?)",
-                    (nid, float(sim), cname, now)
-                )
-                c.execute("""
-                    INSERT INTO attention_stats (cluster_name, hit_count, last_hit, last_narrative_id)
-                    VALUES (?, 1, ?, ?)
-                    ON CONFLICT(cluster_name) DO UPDATE SET
-                        hit_count = hit_count + 1,
-                        last_hit = excluded.last_hit,
-                        last_narrative_id = excluded.last_narrative_id
-                """, (cname, now, nid))
-            
-            c.commit()
+            log_attention(c, scored_results, source=source)
             c.close()
         except Exception:
             pass  # attention tracking should never break prefetch
@@ -560,10 +503,14 @@ class TidelineMemoryProvider(MemoryProvider):
         # tiebreaker = narrative weight
         def _sess_weight(cursor, chunk_list):
             chunk_ids = [str(r["id"]) for r in chunk_list]
+            placeholders = ",".join("?" * len(chunk_ids))
             linked = cursor.execute(
-                """SELECT MAX(weight) as w FROM narratives
-                   WHERE source_links LIKE '%' || ? || '%'""",
-                ("|" + "|".join(chunk_ids) + "|",),
+                f"""SELECT MAX(n.weight) as w FROM narratives n
+                   WHERE EXISTS (
+                       SELECT 1 FROM json_each(n.source_links) je
+                       WHERE je.value IN ({placeholders})
+                   )""",
+                chunk_ids,
             ).fetchone()
             return (linked["w"] or 0) if linked else 0
 
@@ -628,9 +575,10 @@ class TidelineMemoryProvider(MemoryProvider):
                     content = f"[{role}] {text[:2000]}"
                     emb = _embed(content[:500])
                     emb_json = json.dumps(emb) if emb else None
+                    meta = json.dumps({"session": self._session_id, "rescued": True})
                     c.execute(
-                        "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
-                        (content, emb_json, _now()),
+                        "INSERT INTO context (content, embedding, meta, created_at) VALUES (?, ?, ?, ?)",
+                        (content, emb_json, meta, _now()),
                     )
                 c.commit()
                 c.close()
@@ -692,9 +640,10 @@ class TidelineMemoryProvider(MemoryProvider):
                     continue
                 emb = _embed(content[:500])
                 emb_json = json.dumps(emb) if emb else None
+                meta = json.dumps({"session": self._session_id, "session_end": True})
                 c.execute(
-                    "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
-                    (content, emb_json, _now()),
+                    "INSERT INTO context (content, embedding, meta, created_at) VALUES (?, ?, ?, ?)",
+                    (content, emb_json, meta, _now()),
                 )
                 count += 1
             c.commit()
