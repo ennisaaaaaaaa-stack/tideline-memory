@@ -73,6 +73,28 @@ def _cosine(a: list, b: list) -> float:
         return 0.0
     return dot / (na * nb)
 
+def _relative_time(created_at: str) -> str:
+    """Convert timestamp to natural relative time (几天前, 昨天, etc)."""
+    if not created_at:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        ts = created_at.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        days = (now - dt).days
+        if days == 0: return "今天"
+        elif days == 1: return "昨天"
+        elif days <= 6: return f"{days}天前"
+        elif days <= 13: return "上周"
+        elif days <= 29: return f"{days // 7}周前"
+        elif days <= 59: return "上个月"
+        else: return f"{days // 30}个月前"
+    except Exception:
+        return ""
+
 def _embed(text: str) -> list:
     """Get embedding from local bge-m3 or remote OpenAI-compatible API."""
     import urllib.request, json
@@ -354,7 +376,8 @@ class TidelineMemoryProvider(MemoryProvider):
                     for sim, r in top:
                         cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
                         ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
-                        lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx} [sim={sim:.2f}]")
+                        rt = f" ({_relative_time(r['created_at'])})" if r.get("created_at") else ""
+                        lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx}{rt}")
                     lines.append("\n## 远期记忆（FTS5 fallback）\n")
                     lines.append(t4_results)
                     c.close()
@@ -370,7 +393,8 @@ class TidelineMemoryProvider(MemoryProvider):
             for sim, r in top:
                 cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
                 ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
-                lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx} [sim={sim:.2f}]")
+                rt = f" ({_relative_time(r['created_at'])})" if r.get("created_at") else ""
+                lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx}{rt}")
 
             # Non-silent degradation notice
             if scan_truncated:
