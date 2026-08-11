@@ -295,15 +295,49 @@ class TidelineMemoryProvider(MemoryProvider):
                 parts.append("\n".join(lines))
 
             # ── T3b: People I know (profiles) ──
+            # Strategy: user profile fixed + pinned profiles full + summaries for rest
+            import os as _os_pin
+            pin_path = _os_pin.path.expanduser("~/.hermes/profile_pins.json")
+            pinned = []
+            try:
+                with open(pin_path) as _pf:
+                    pinned = json.load(_pf)
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+
+            # Fixed entities always injected in full: self + 甜心(user)
+            # Pinned entities injected in full (up to 2 pins)
+            full_entities = {"self", "甜心"}
+            full_entities.update(pinned[:2])
+
+            # Fetch all profiles
             profiles = c.execute(
                 """SELECT entity, ptype, content FROM profiles ORDER BY entity"""
             ).fetchall()
             if profiles:
-                lines = ["## 人物画像\n"]
+                # Group by entity
+                from collections import defaultdict
+                by_entity = defaultdict(list)
                 for p in profiles:
-                    content = p['content'] or ''
-                    if content:
-                        lines.append(f"**{p['entity']}** {content}")
+                    by_entity[p['entity']].append(p)
+
+                lines = ["## 人物画像\n"]
+                for entity, plist in by_entity.items():
+                    if entity in full_entities:
+                        # Full injection: all ptypes
+                        for p in plist:
+                            content = p['content'] or ''
+                            if content:
+                                lines.append(f"**{entity}** ({p['ptype'] or ''}): {content}")
+                    else:
+                        # Summary injection: first 1-2 sentences of contact ptype only
+                        contact = next((p for p in plist if p['ptype'] == 'contact'), None)
+                        if contact:
+                            raw = (contact['content'] or '').strip()
+                            # Take first ~100 chars as summary
+                            summary = raw[:100].rsplit('。', 1)[0] + '。' if '。' in raw[:100] else raw[:100]
+                            lines.append(f"**{entity}** ({contact['ptype'] or ''}): {summary}")
+
                 if len(lines) > 1:
                     parts.append("\n".join(lines))
 
