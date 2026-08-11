@@ -30,3 +30,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Local-only content (not for open source)
+marketing/
