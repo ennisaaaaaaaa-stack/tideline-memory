@@ -295,29 +295,34 @@ class TidelineMemoryProvider(MemoryProvider):
                 parts.append("\n".join(lines))
 
             # ── T3b: People I know (profiles) ──
-            # Strategy: user profile fixed + pinned profiles full + summaries for rest
+            # Strategy: fixed entities (full) + pinned entities (full) + rest (summary)
             import os as _os_pin
+            from collections import defaultdict as _dd
             pin_path = _os_pin.path.expanduser("~/.hermes/profile_pins.json")
-            pinned = []
+            fixed_entities = {"self"}
+            pinned_entities = []
             try:
                 with open(pin_path) as _pf:
-                    pinned = json.load(_pf)
+                    _pin_data = json.load(_pf)
+                # Support both formats: {"fixed":[...], "pinned":[...]} or plain [...]
+                if isinstance(_pin_data, dict):
+                    fixed_entities = set(_pin_data.get("fixed", ["self"]))
+                    _pinned_raw = _pin_data.get("pinned", [])
+                else:
+                    _pinned_raw = _pin_data
+                # Dedup: pinned entries already in fixed don't count
+                pinned_entities = [p for p in _pinned_raw if p not in fixed_entities][:2]
             except (FileNotFoundError, json.JSONDecodeError):
                 pass
 
-            # Fixed entities always injected in full: self + 甜心(user)
-            # Pinned entities injected in full (up to 2 pins)
-            full_entities = {"self", "甜心"}
-            full_entities.update(pinned[:2])
+            full_entities = fixed_entities | set(pinned_entities)
 
             # Fetch all profiles
             profiles = c.execute(
                 """SELECT entity, ptype, content FROM profiles ORDER BY entity"""
             ).fetchall()
             if profiles:
-                # Group by entity
-                from collections import defaultdict
-                by_entity = defaultdict(list)
+                by_entity = _dd(list)
                 for p in profiles:
                     by_entity[p['entity']].append(p)
 
@@ -330,13 +335,19 @@ class TidelineMemoryProvider(MemoryProvider):
                             if content:
                                 lines.append(f"**{entity}** ({p['ptype'] or ''}): {content}")
                     else:
-                        # Summary injection: first 1-2 sentences of contact ptype only
-                        contact = next((p for p in plist if p['ptype'] == 'contact'), None)
-                        if contact:
-                            raw = (contact['content'] or '').strip()
-                            # Take first ~100 chars as summary
-                            summary = raw[:100].rsplit('。', 1)[0] + '。' if '。' in raw[:100] else raw[:100]
-                            lines.append(f"**{entity}** ({contact['ptype'] or ''}): {summary}")
+                        # Summary injection: prefer contact ptype, fallback to first available
+                        summary_p = next((p for p in plist if p['ptype'] == 'contact'), None)
+                        if summary_p is None and plist:
+                            summary_p = plist[0]  # fallback: no contact, use first ptype
+                        if summary_p:
+                            raw = (summary_p['content'] or '').strip()
+                            if len(raw) <= 100:
+                                summary = raw  # short enough, no truncation
+                            elif '。' in raw[:100]:
+                                summary = raw[:100].rsplit('。', 1)[0] + '。'
+                            else:
+                                summary = raw[:100]
+                            lines.append(f"**{entity}** ({summary_p['ptype'] or ''}): {summary}")
 
                 if len(lines) > 1:
                     parts.append("\n".join(lines))
