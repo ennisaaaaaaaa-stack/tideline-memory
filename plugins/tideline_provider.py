@@ -189,6 +189,7 @@ class TidelineMemoryProvider(MemoryProvider):
         self._session_id = ""
         self._prefetch_cache: str = ""
         self._turn_count = 0
+        self._injected_ids: set = set()  # cross-turn dedup within a session
 
     @property
     def name(self) -> str:
@@ -200,6 +201,7 @@ class TidelineMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._turn_count = 0
+        self._injected_ids = set()  # reset dedup set for new session
         logger.info("Tideline memory provider initialized (session=%s, db=%s)",
                      session_id, self._db_path)
 
@@ -365,7 +367,14 @@ class TidelineMemoryProvider(MemoryProvider):
                     scored.append((sim, r))
 
             scored.sort(key=lambda x: x[0], reverse=True)
-            top = scored[:5]
+
+            # ── Cross-turn dedup: skip narratives already injected this session ──
+            fresh = [(sim, r) for sim, r in scored if r["id"] not in self._injected_ids]
+            top = fresh[:5]
+
+            # If dedup leaves <2 results, relax: allow re-injection of top hits
+            if len(top) < 2 and scored:
+                top = scored[:5]  # fallback: no dedup when too few fresh hits
 
             # ── T4: Fallback to full FTS5 search when T1 misses ──
             if len(top) < 2:
@@ -382,6 +391,9 @@ class TidelineMemoryProvider(MemoryProvider):
                     c.close()
                     result = "\n".join(lines)
                     self._prefetch_cache = result
+                    for _, r in top:
+                        self._injected_ids.add(r["id"])
+                    self._log_attention(top)
                     return result
 
             if not top:
@@ -400,10 +412,9 @@ class TidelineMemoryProvider(MemoryProvider):
             c.close()
             result = "\n".join(lines)
             self._prefetch_cache = result
-            
-            # ── Attention tracking: log T1 hits for distribution analysis ──
+            for _, r in top:
+                self._injected_ids.add(r["id"])
             self._log_attention(top)
-            
             return result
 
         except Exception as e:
