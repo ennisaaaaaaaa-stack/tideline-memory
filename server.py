@@ -748,7 +748,7 @@ async def _dispatch(name, a, c):
         context_layer = a.get("context", "")
         moment_val = a.get("moment", "")
         cog_dir = a.get("cognition_direction", "")
-        links = a.get("source_links", [])
+        links = [str(x) for x in a.get("source_links", []) if str(x).strip()]
         tags = a.get("tags", [])
         entities_role = a.get("entities_role", "")
         ntype = a.get("narrative_type", "general")
