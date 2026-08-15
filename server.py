@@ -377,7 +377,7 @@ def _fmt_narrative(r):
             if ents: parts.append(f"   👤 {', '.join(ents)}")
         if links:
             lks = json.loads(links) if links else []
-            if lks: parts.append(f"   🔗 {', '.join(lks)}")
+            if lks: parts.append(f"   🔗 {', '.join(str(x) for x in lks)}")
         w_str = f"  w={weight:.2f}" if weight else ""
         parts.append(f"   [{r['created_at']}]{w_str}")
         return "\n".join(parts)

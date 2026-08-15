@@ -72,7 +72,7 @@ def backfill():
         ).fetchall()
 
         if context_rows:
-            ids = [r["id"] for r in context_rows]
+            ids = [str(r["id"]) for r in context_rows]
             links_json = json.dumps(ids)
             c.execute(
                 "UPDATE narratives SET source_links = ? WHERE id = ?",
@@ -94,7 +94,7 @@ def backfill():
             ).fetchall()
 
             if any_rows:
-                ids = [r["id"] for r in any_rows[:20]]  # cap at 20
+                ids = [str(r["id"]) for r in any_rows[:20]]  # cap at 20 (str: server joins them)
                 links_json = json.dumps(ids)
                 c.execute(
                     "UPDATE narratives SET source_links = ? WHERE id = ?",
@@ -112,7 +112,7 @@ def backfill():
                 ).fetchall()
 
                 if date_rows:
-                    ids = [r["id"] for r in date_rows[:20]]
+                    ids = [str(r["id"]) for r in date_rows[:20]]
                     links_json = json.dumps(ids)
                     c.execute(
                         "UPDATE narratives SET source_links = ? WHERE id = ?",
