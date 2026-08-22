@@ -33,3 +33,4 @@ Thumbs.db
 
 # Local-only content (not for open source)
 marketing/
+plugins/_persona_override.py
