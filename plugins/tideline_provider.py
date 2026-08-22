@@ -413,13 +413,17 @@ class TidelineMemoryProvider(MemoryProvider):
 
             scored.sort(key=lambda x: x[0], reverse=True)
 
-            # ── Cross-turn dedup: skip narratives already injected this session ──
-            fresh = [(sim, r) for sim, r in scored if r["id"] not in self._injected_ids]
-            top = fresh[:5]
+            # ── Cross-turn dedup (v2: top-3 + rollover + full-guard) ──
+            # If the 5 strongest matches were ALL injected this session,
+            # this turn is a topic continuation — skip injection entirely
+            # instead of scraping lower-similarity tails into context.
+            if scored and all(r["id"] in self._injected_ids for _, r in scored[:5]):
+                c.close()
+                self._prefetch_cache = ""
+                return ""
 
-            # If dedup leaves <2 results, relax: allow re-injection of top hits
-            if len(top) < 2 and scored:
-                top = scored[:5]  # fallback: no dedup when too few fresh hits
+            fresh = [(sim, r) for sim, r in scored if r["id"] not in self._injected_ids]
+            top = fresh[:3]  # top-3, rolling past already-injected hits
 
             # ── T4: Fallback to full FTS5 search when T1 misses ──
             if len(top) < 2:
