@@ -59,11 +59,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(_DB_PATH, timeout=30)
+    c = sqlite3.connect(_DB_PATH, timeout=5)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=30000")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
+
+def _clip(text: str, n: int) -> str:
+    """Truncate injection line to n chars, ellipsis if cut."""
+    if len(text) <= n:
+        return text
+    return text[:n].rstrip() + "…"
+
 
 def _cosine(a: list, b: list) -> float:
     dot = sum(x * y for x, y in zip(a, b))
@@ -72,28 +79,6 @@ def _cosine(a: list, b: list) -> float:
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
-
-def _relative_time(created_at: str) -> str:
-    """Convert timestamp to natural relative time (几天前, 昨天, etc)."""
-    if not created_at:
-        return ""
-    try:
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
-        ts = created_at.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        days = (now - dt).days
-        if days == 0: return "今天"
-        elif days == 1: return "昨天"
-        elif days <= 6: return f"{days}天前"
-        elif days <= 13: return "上周"
-        elif days <= 29: return f"{days // 7}周前"
-        elif days <= 59: return "上个月"
-        else: return f"{days // 30}个月前"
-    except Exception:
-        return ""
 
 def _embed(text: str) -> list:
     """Get embedding from local bge-m3 or remote OpenAI-compatible API."""
@@ -107,7 +92,7 @@ def _embed(text: str) -> list:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
                 embeddings = data.get("embeddings", [])
                 return embeddings[0] if embeddings else []
@@ -200,6 +185,9 @@ class TidelineMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
+        # agent_context: "primary" | "subagent" | "cron" | "flush".
+        # Epilogues are only for primary conversations (real windows).
+        self._agent_context = kwargs.get("agent_context") or "primary"
         self._turn_count = 0
         self._injected_ids = set()  # reset dedup set for new session
         logger.info("Tideline memory provider initialized (session=%s, db=%s)",
@@ -218,9 +206,9 @@ class TidelineMemoryProvider(MemoryProvider):
                 "SELECT field, content FROM self_concept ORDER BY field"
             ).fetchall()
             if sc_rows:
-                lines = []
+                lines = ["## 自我概念（auto-injected）\n"]
                 for r in sc_rows:
-                    lines.append(r['content'])
+                    lines.append(f"**[{r['field']}]** {r['content']}")
                 parts.append("\n".join(lines))
 
             # 2. Latest snapshot (current state)
@@ -237,7 +225,8 @@ class TidelineMemoryProvider(MemoryProvider):
             if threads:
                 lines = ["## 待探索的线索\n"]
                 for t in threads:
-                    lines.append(f"- {t['content']}")
+                    w = f" (w={t['weight']:.2f})" if t["weight"] else ""
+                    lines.append(f"- {t['content']}{w}")
                 parts.append("\n".join(lines))
 
             # 4. Prefetch pool (high-weight recent memories, deduplicated by tag)
@@ -270,12 +259,6 @@ class TidelineMemoryProvider(MemoryProvider):
                         cd = f" → {_strip_tags(m['cognition_direction'])}" if m["cognition_direction"] else ""
                         lines.append(f"- {g}{cd}")
                     parts.append("\n".join(lines))
-                    
-                    # ── Log T0 passive injection as attention hits ──
-                    # These narratives enter model view without a query — pure weight-driven.
-                    # sim=0 (no semantic query involved), source='t0_inject'
-                    t0_scored = [(0.0, m) for m in deduped]
-                    self._log_attention(t0_scored, source="t0_inject")
 
             # ── T2b: Context bridge (recent raw conversation chunks) ──
             bridge = self._context_bridge(c)
@@ -379,7 +362,7 @@ class TidelineMemoryProvider(MemoryProvider):
             # Get all narratives with embeddings
             rows = c.execute(
                 """SELECT id, gesture, context_layer, cognition_direction, weight,
-                          embedding, tags, created_at
+                          embedding, tags
                    FROM narratives
                    WHERE gesture IS NOT NULL AND gesture != ''
                    AND embedding IS NOT NULL
@@ -398,6 +381,7 @@ class TidelineMemoryProvider(MemoryProvider):
                 scan_rows = rows[:SCAN_LIMIT]
                 scan_truncated = True
 
+            import json
             scored = []
             for r in scan_rows:
                 emb_raw = r["embedding"]
@@ -433,8 +417,7 @@ class TidelineMemoryProvider(MemoryProvider):
                     for sim, r in top:
                         cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
                         ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
-                        rt = f" ({_relative_time(r['created_at'])})" if r["created_at"] else ""
-                        lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx}{rt}")
+                        lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx} [sim={sim:.2f}]")
                     lines.append("\n## 远期记忆（FTS5 fallback）\n")
                     lines.append(t4_results)
                     c.close()
@@ -451,12 +434,12 @@ class TidelineMemoryProvider(MemoryProvider):
 
             lines = ["## 相关记忆（auto-recalled）\n"]
             for sim, r in top:
-                cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
-                ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
-                rt = f" ({_relative_time(r['created_at'])})" if r["created_at"] else ""
-                lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx}{rt}")
+                cd = f" → {_clip(_strip_tags(r['cognition_direction']), 80)}" if r["cognition_direction"] else ""
+                lines.append(f"- {_clip(_strip_tags(r['gesture']), 120)}{cd} [sim={sim:.2f}]")
 
-            # Silent degradation: don't expose scan limits in injection
+            # Non-silent degradation notice
+            if scan_truncated:
+                lines.append(f"\n⚠️ 语义检索覆盖最近 {SCAN_LIMIT}/{len(rows)} 条记忆，更早的记忆未被扫描。")
 
             c.close()
             result = "\n".join(lines)
@@ -470,14 +453,76 @@ class TidelineMemoryProvider(MemoryProvider):
             logger.warning("Tideline prefetch failed: %s", e)
             return ""
 
-    def _log_attention(self, scored_results, source="t1_prefetch"):
-        """Delegate to shared attention tracking module."""
+    def _log_attention(self, scored_results):
+        """Log T1 retrieval hits for attention distribution tracking.
+        
+        Called after each successful prefetch. Pure bookkeeping — zero LLM cost.
+        Records which narratives/clusters got "lit up" by semantic search.
+        """
         if not scored_results:
             return
         try:
-            from scripts.attention_shared import log_attention
             c = _db()
-            log_attention(c, scored_results, source=source)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS attention_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    narrative_id INTEGER NOT NULL,
+                    sim REAL,
+                    cluster_name TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS attention_stats (
+                    cluster_name TEXT PRIMARY KEY,
+                    hit_count INTEGER DEFAULT 0,
+                    last_hit TEXT,
+                    last_narrative_id INTEGER
+                )
+            """)
+            
+            # Build cluster lookup from BOTH topic_clusters (jieba) AND emb_cluster_members
+            jieba_map = {}
+            rows = c.execute("SELECT cluster_name, narrative_ids FROM topic_clusters").fetchall()
+            for r in rows:
+                try:
+                    nids = json.loads(r["narrative_ids"])
+                    for nid in nids:
+                        jieba_map[nid] = r["cluster_name"]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            emb_map = {}
+            try:
+                emb_rows = c.execute("SELECT narrative_id, cluster_id FROM emb_cluster_members").fetchall()
+                for r in emb_rows:
+                    emb_map.setdefault(r["narrative_id"], []).append(r["cluster_id"])
+            except sqlite3.OperationalError:
+                pass  # emb tables not built yet
+            
+            now = _now()
+            for sim, r in scored_results:
+                nid = r["id"]
+                names = []
+                if nid in jieba_map:
+                    names.append(f"jieba:{jieba_map[nid]}")
+                if nid in emb_map:
+                    names.append(f"emb:#{','.join(str(c) for c in emb_map[nid])}")
+                cname = " | ".join(names) if names else "_unclassified"
+                c.execute(
+                    "INSERT INTO attention_log (narrative_id, sim, cluster_name, created_at) VALUES (?,?,?,?)",
+                    (nid, float(sim), cname, now)
+                )
+                c.execute("""
+                    INSERT INTO attention_stats (cluster_name, hit_count, last_hit, last_narrative_id)
+                    VALUES (?, 1, ?, ?)
+                    ON CONFLICT(cluster_name) DO UPDATE SET
+                        hit_count = hit_count + 1,
+                        last_hit = excluded.last_hit,
+                        last_narrative_id = excluded.last_narrative_id
+                """, (cname, now, nid))
+            
+            c.commit()
             c.close()
         except Exception:
             pass  # attention tracking should never break prefetch
@@ -583,15 +628,18 @@ class TidelineMemoryProvider(MemoryProvider):
         # Sort sessions: primary = recency (latest entry DESC),
         # tiebreaker = narrative weight
         def _sess_weight(cursor, chunk_list):
+            # source_links stores a JSON array (["72709","72710"]; legacy rows
+            # may hold bare ints). The old pipe-format LIKE never matched JSON
+            # and silently returned 0 forever. Bare substring per id catches
+            # both forms; collisions (id substring of another id) only nudge
+            # this soft tiebreaker, which is acceptable here.
             chunk_ids = [str(r["id"]) for r in chunk_list]
-            placeholders = ",".join("?" * len(chunk_ids))
+            conds = " OR ".join(["source_links LIKE ?"] * len(chunk_ids))
+            params = [f"%{cid}%" for cid in chunk_ids]
             linked = cursor.execute(
-                f"""SELECT MAX(n.weight) as w FROM narratives n
-                   WHERE EXISTS (
-                       SELECT 1 FROM json_each(n.source_links) je
-                       WHERE je.value IN ({placeholders})
-                   )""",
-                chunk_ids,
+                f"""SELECT MAX(weight) as w FROM narratives
+                    WHERE ({conds})""",
+                params,
             ).fetchone()
             return (linked["w"] or 0) if linked else 0
 
@@ -656,10 +704,9 @@ class TidelineMemoryProvider(MemoryProvider):
                     content = f"[{role}] {text[:2000]}"
                     emb = _embed(content[:500])
                     emb_json = json.dumps(emb) if emb else None
-                    meta = json.dumps({"session": self._session_id, "rescued": True})
                     c.execute(
-                        "INSERT INTO context (content, embedding, meta, created_at) VALUES (?, ?, ?, ?)",
-                        (content, emb_json, meta, _now()),
+                        "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
+                        (content, emb_json, _now()),
                     )
                 c.commit()
                 c.close()
@@ -683,7 +730,7 @@ class TidelineMemoryProvider(MemoryProvider):
             if not rows:
                 return ""
 
-            lines = ["高权重记忆：\n"]
+            lines = ["[Tideline memory rescue] 高权重记忆不可遗忘：\n"]
             for r in rows:
                 cd = f" → {r['cognition_direction']}" if r["cognition_direction"] else ""
                 lines.append(f"- {r['gesture']}{cd}")
@@ -693,7 +740,7 @@ class TidelineMemoryProvider(MemoryProvider):
             logger.debug("Tideline on_pre_compress reminder failed: %s", e)
             return ""
 
-    # ═══ on_session_end (session boundary checkpoint) ═════
+    # ═══ on_session_end (session boundary checkpoint) ═══════
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Session boundary checkpoint: persist the full conversation tail.
@@ -702,47 +749,109 @@ class TidelineMemoryProvider(MemoryProvider):
         all user messages and substantive assistant responses, writes them
         to context table with embeddings. This is the safety net that
         catches anything not already persisted by sync_turn.
+
+        2026-08-22: after persisting, fire the auto-epilogue in a background
+        thread (Plan B — closed windows become immediately retrievable via
+        T1/T4, no DREAM wait). One logic, many shells: the writer lives in
+        tideline-memory/plugins/session_epilogue.py (same pattern as
+        memory_mirror). Background thread so the new session's first
+        response is never blocked by the LLM call (~15-25k tokens, 30-60s).
         """
+        closed_session = self._session_id
         try:
             extracted = _extract_conversation(messages)
-            if not extracted:
-                return
+            if extracted:
+                c = _db()
+                count = 0
+                for role, text in extracted:
+                    content = f"[{role}] {text[:2000]}"
+                    # Check if already persisted by sync_turn (dedup by content prefix)
+                    existing = c.execute(
+                        "SELECT 1 FROM context WHERE content = ? LIMIT 1",
+                        (content,),
+                    ).fetchone()
+                    if existing:
+                        continue
+                    emb = _embed(content[:500])
+                    emb_json = json.dumps(emb) if emb else None
+                    c.execute(
+                        "INSERT INTO context (content, embedding, created_at) VALUES (?, ?, ?)",
+                        (content, emb_json, _now()),
+                    )
+                    count += 1
+                c.commit()
+                c.close()
 
-            c = _db()
-            count = 0
-            for role, text in extracted:
-                content = f"[{role}] {text[:2000]}"
-                # Check if already persisted by sync_turn (dedup by content prefix)
-                existing = c.execute(
-                    "SELECT 1 FROM context WHERE content = ? LIMIT 1",
-                    (content,),
-                ).fetchone()
-                if existing:
-                    continue
-                emb = _embed(content[:500])
-                emb_json = json.dumps(emb) if emb else None
-                meta = json.dumps({"session": self._session_id, "session_end": True})
-                c.execute(
-                    "INSERT INTO context (content, embedding, meta, created_at) VALUES (?, ?, ?, ?)",
-                    (content, emb_json, meta, _now()),
-                )
-                count += 1
-            c.commit()
-            c.close()
-
-            if count:
-                logger.info(
-                    "Tideline on_session_end: persisted %d new messages at session boundary",
-                    count,
-                )
+                if count:
+                    logger.info(
+                        "Tideline on_session_end: persisted %d new messages at session boundary",
+                        count,
+                    )
         except Exception as e:
             logger.debug("Tideline on_session_end failed: %s", e)
+
+        # ── Auto-epilogue (Plan B, 2026-08-22) ──
+        if closed_session and getattr(self, "_agent_context", "primary") == "primary":
+            def _bg_epilogue():
+                try:
+                    from tideline_memory_plugins import session_epilogue
+                except ImportError:
+                    import importlib.util, sys
+                    _p = Path("/home/ubuntu/tideline-memory/plugins/session_epilogue.py")
+                    if not _p.exists():
+                        return
+                    if "session_epilogue" in sys.modules:
+                        session_epilogue = sys.modules["session_epilogue"]
+                    else:
+                        _spec = importlib.util.spec_from_file_location("session_epilogue", _p)
+                        session_epilogue = importlib.util.module_from_spec(_spec)
+                        _spec.loader.exec_module(session_epilogue)
+                try:
+                    status = session_epilogue.write_epilogue_for_session(closed_session)
+                    if not status.startswith("skip"):
+                        logger.info("Tideline epilogue: %s", status)
+                except Exception as e:
+                    logger.warning("Tideline epilogue thread failed: %s", e)
+
+            threading.Thread(target=_bg_epilogue, daemon=True, name="tideline-epilogue").start()
 
     # ═══ No tools (MCP server handles interactive) ════════
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return empty — MCP server provides all interactive memory tools."""
         return []
+
+    # ═══ on_memory_write (mirror built-in writes → context rows) ═══
+    # 2026-08-20: mirror MEMORY.md/USER.md edits into Tideline context table
+    # so memory decisions are semantically searchable. Standalone logic lives
+    # in tideline-memory/plugins/memory_mirror.py (shared shell); this method
+    # delegates to it — one logic, two shells (plugin + standalone import).
+
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            from tideline_memory_plugins import memory_mirror
+        except ImportError:
+            # fallback: load by path if package not on sys.path
+            import importlib.util, sys
+            _p = Path("/home/ubuntu/tideline-memory/plugins/memory_mirror.py")
+            if not _p.exists():
+                return
+            if "memory_mirror" in sys.modules:
+                memory_mirror = sys.modules["memory_mirror"]
+            else:
+                _spec = importlib.util.spec_from_file_location("memory_mirror", _p)
+                memory_mirror = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(memory_mirror)
+        try:
+            memory_mirror.on_memory_write(action, target, content, metadata)
+        except Exception as e:
+            logger.debug("Tideline on_memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         logger.info("Tideline memory provider shutdown")
