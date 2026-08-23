@@ -815,6 +815,25 @@ class TidelineMemoryProvider(MemoryProvider):
 
             threading.Thread(target=_bg_epilogue, daemon=True, name="tideline-epilogue").start()
 
+        # ── spoor session gap（v0.4.3, 2026-08-23）──
+        # 会话收口时做纯机械 diff：messages 里触达过的项目桌 vs 账本
+        # journal.write，缺口落账本 spoor.session.gap 事件；下个 session
+        # 的 workbench 工具返回尾部浮现（pending_sessgap，消费即记录）。
+        # 钩子只提醒，裁判是 agent；失败静默（提案 #2 纪律）。
+        try:
+            import sys as _sys
+            _sg = "/home/ubuntu/Stigmergy/spoor_common.py"
+            if "spoor_common" in _sys.modules:
+                _sc = _sys.modules["spoor_common"]
+            else:
+                import importlib.util
+                _spec = importlib.util.spec_from_file_location("spoor_common", _sg)
+                _sc = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_sc)
+            _sc.record_session_gap(messages)
+        except Exception as _e:
+            logger.debug("spoor session gap hook failed: %s", _e)
+
     # ═══ No tools (MCP server handles interactive) ════════
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
