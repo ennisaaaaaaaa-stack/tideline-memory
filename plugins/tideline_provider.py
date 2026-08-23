@@ -797,7 +797,8 @@ class TidelineMemoryProvider(MemoryProvider):
                     from tideline_memory_plugins import session_epilogue
                 except ImportError:
                     import importlib.util, sys
-                    _p = Path("/home/ubuntu/tideline-memory/plugins/session_epilogue.py")
+                    _tmr = _os.environ.get("TIDELINE_MEMORY_ROOT", str(Path.home() / "tideline-memory"))
+                    _p = Path(_tmr) / "plugins" / "session_epilogue.py"
                     if not _p.exists():
                         return
                     if "session_epilogue" in sys.modules:
@@ -819,20 +820,26 @@ class TidelineMemoryProvider(MemoryProvider):
         # 会话收口时做纯机械 diff：messages 里触达过的项目桌 vs 账本
         # journal.write，缺口落账本 spoor.session.gap 事件；下个 session
         # 的 workbench 工具返回尾部浮现（pending_sessgap，消费即记录）。
-        # 钩子只提醒，裁判是 agent；失败静默（提案 #2 纪律）。
+        # 钩子只提醒，裁判是 agent。
+        # 部署路径纪律（照照 8/23 审）：env 注入优先，默认 $HOME 相对——
+        # 不再硬编码洄 VPS 的绝对路径；缺席=debug（正当 idle），炸=warning。
         try:
             import sys as _sys
-            _sg = "/home/ubuntu/Stigmergy/spoor_common.py"
-            if "spoor_common" in _sys.modules:
-                _sc = _sys.modules["spoor_common"]
+            _root = Path(_os.environ.get("STIGMERGY_ROOT", str(Path.home() / "Stigmergy")))
+            _sg = _root / "spoor_common.py"
+            if not _sg.exists():
+                logger.debug("spoor session gap: Stigmergy root not found at %s (idle)", _root)
             else:
-                import importlib.util
-                _spec = importlib.util.spec_from_file_location("spoor_common", _sg)
-                _sc = importlib.util.module_from_spec(_spec)
-                _spec.loader.exec_module(_sc)
-            _sc.record_session_gap(messages)
+                if "spoor_common" in _sys.modules:
+                    _sc = _sys.modules["spoor_common"]
+                else:
+                    import importlib.util
+                    _spec = importlib.util.spec_from_file_location("spoor_common", _sg)
+                    _sc = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_sc)
+                _sc.record_session_gap(messages)
         except Exception as _e:
-            logger.debug("spoor session gap hook failed: %s", _e)
+            logger.warning("spoor session gap hook failed: %s", _e)
 
     # ═══ No tools (MCP server handles interactive) ════════
 
@@ -858,7 +865,8 @@ class TidelineMemoryProvider(MemoryProvider):
         except ImportError:
             # fallback: load by path if package not on sys.path
             import importlib.util, sys
-            _p = Path("/home/ubuntu/tideline-memory/plugins/memory_mirror.py")
+            _tmr = _os.environ.get("TIDELINE_MEMORY_ROOT", str(Path.home() / "tideline-memory"))
+            _p = Path(_tmr) / "plugins" / "memory_mirror.py"
             if not _p.exists():
                 return
             if "memory_mirror" in sys.modules:
