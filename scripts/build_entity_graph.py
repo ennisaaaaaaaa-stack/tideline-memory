@@ -19,6 +19,16 @@ from pathlib import Path
 # ── Config ──
 DEFAULT_DB = Path.home() / "memory" / "mcp_memory.db"
 
+# Known persons for relay-chain fan-out (canonical()). Comma-separated env
+# override: KNOWN_PERSONS="甜心,照照,洄洄". Keep in sync with server.py's
+# KNOWN_PERSONS config.
+import os
+_KNOWN = os.environ.get(
+    "KNOWN_PERSONS",
+    "甜心,照照,洄洄,鸣鸣,ZCode,Kimi3,Eve,Tim King",
+)
+KNOWN_PERSONS = {p.strip() for p in _KNOWN.split(",") if p.strip()}
+
 
 def init_graph_tables(c: sqlite3.Connection):
     """Create graph tables if they don't exist."""
@@ -60,41 +70,70 @@ def parse_entities_role(text: str) -> dict:
         "A=判断+执行; B=审查"
         "甜心(用户)=解释为什么做; 洄=观察协作模式"
         "A=ssh救援; B=架构判断; C=在挂"
+        "甜心（用户）→ 需求拆解；洄洄（云实例）→ 写代码；照照（本地实例）→ review"  (v2: 全角；/→)
+        "甜心引入→照照主动接触→Kimi3回应"  (v2: 链式事件流, 共现, 角色留空)
+
+    v2 changes (2026-08-26, 照照 — fix: 47/47 production entities_role rows
+    matched ZERO of the old patterns, graph tables stayed empty for months):
+      1. separators: ';' also '；'
+      2. assignment: '=' also '→'
+      3. chain format (no separator, arrows between clauses): treat as
+         co-occurrence — entities enter the graph, roles left empty
+      4. name-length cap 12 chars: longer "names" are unparseable prose,
+         dropped rather than becoming garbage nodes
+      5. canonical(): a name fragment containing multiple known persons
+         fans out to all of them ("甜心转述洄洄修复消息" → 甜心, 洄洄) —
+         the messenger AND the letter-writer both get credited
     """
     if not text or not text.strip():
         return {}
 
+    MAX_NAME_LEN = 12
     result = {}
-    # Split by semicolon (but not inside parentheses)
-    parts = re.split(r';\s*(?![^()]*\))', text.strip())
+    text = text.strip()
 
-    for part in parts:
-        part = part.strip()
-        if not part or '=' not in part:
-            continue
+    # 形态1: ；或; 分隔的段，每段 实体=角色 或 实体→角色
+    seg_pat = re.compile(r"^(.{1,%d}?)[（(]?\s*(?:→|=)\s*(.+)$" % MAX_NAME_LEN)
+    if re.search(r"[；;]", text):
+        for part in re.split(r"[；;]", text):
+            part = part.strip()
+            if not part:
+                continue
+            m = seg_pat.match(part)
+            if m:
+                name = re.sub(r"\s*[（(][^)）]*[)）]\s*", "", m.group(1)).strip()
+                role = m.group(2).strip()
+                for ent in canonical(name, MAX_NAME_LEN):
+                    result[ent] = role
+        return result
 
-        # Split on first '=' only (role descriptions may contain '=')
-        entity_raw, role = part.split('=', 1)
-        entity_raw = entity_raw.strip()
-        role = role.strip()
+    # 形态2: 链式 实体A动作→实体B动作→实体C动作 —— 共现，角色留空
+    if text.count("→") >= 1:
+        entities = set()
+        for seg in (s.strip() for s in text.split("→")):
+            known = [k for k in KNOWN_PERSONS if k in seg]
+            if known:
+                entities.update(known)
+            else:
+                m = re.match(r"^([\u4e00-\u9fa5A-Za-z0-9 ]{1,6}?)(?:主动|发现|提出|设计|写|修|审|转|否|采|接|回|承|指|推|做)", seg)
+                if m and m.group(1).strip():
+                    entities.add(m.group(1).strip())
+        if entities:
+            return {e: "" for e in entities}
+    return {}
 
-        if not entity_raw or not role:
-            continue
 
-        # Clean up entity name: remove parenthetical notes like "(用户)"
-        # But keep them as alias info
-        paren_match = re.search(r'\(([^)]+)\)', entity_raw)
-        alias = paren_match.group(1) if paren_match else None
-        entity = re.sub(r'\s*\([^)]+\)', '', entity_raw).strip()
+def canonical(name: str, max_len: int = 12) -> list:
+    """Name fragment → canonical entity list.
 
-        if alias and entity:
-            # If the clean entity is a known short name, use it
-            pass
-
-        if entity:
-            result[entity] = role
-
-    return result
+    Fragment containing several known persons fans out to all of them
+    (relay-chain credit: messenger + letter-writer both recorded).
+    Unknown fragments: keep if short (dream figures like 当铺掌柜),
+    drop if long (unparseable prose)."""
+    found = [k for k in KNOWN_PERSONS if k in name]
+    if found:
+        return found
+    return [name] if 0 < len(name) <= max_len else []
 
 
 def rebuild_graph(db_path: Path):
