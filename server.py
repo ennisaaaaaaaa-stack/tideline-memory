@@ -1534,9 +1534,9 @@ async def _dispatch(name, a, c):
                 related_entities, source_links, entities_role,
                 weight, importance, emotional, recurrence, unresolved)
                VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?,?)""",
-            (content, ntype, json.dumps(tags), json.dumps(emb) if emb else None, _now(),
+            (content, ntype, json.dumps(tags, ensure_ascii=False), json.dumps(emb) if emb else None, _now(),
              gesture, context_layer, moment_val, cog_dir,
-             json.dumps(related), json.dumps([str(x) for x in links]), entities_role,
+             json.dumps(related, ensure_ascii=False), json.dumps([str(x) for x in links]), entities_role,
              weight, imp, emo, rec, unr),
         )
         c.commit()
