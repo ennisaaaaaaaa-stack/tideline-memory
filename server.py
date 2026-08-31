@@ -374,7 +374,7 @@ def _fmt_narrative(r):
         if cog:  parts.append(f"   🧭 {cog}")
         if ent:
             ents = json.loads(ent) if ent else []
-            if ents: parts.append(f"   👤 {', '.join(ents)}")
+            if ents: parts.append(f"   👤 {', '.join(str(e) for e in ents)}")
         if links:
             lks = json.loads(links) if links else []
             if lks: parts.append(f"   🔗 {', '.join(str(x) for x in lks)}")
