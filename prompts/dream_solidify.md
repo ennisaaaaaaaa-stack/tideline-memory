@@ -71,6 +71,22 @@ source_links: [56153, 56154, 56155]
 5. 用 `memory_write` 逐条写入，**填 source_links**
 6. 完成后汇报：扫了多少块、写了多少条、跳过了多少块、Track A 有多少条待补全
 
+## ⑤ 多看一眼：冲突嫌疑清单（2026-09-01 甜心批准）
+
+固化写入完成后，跑发现层扫描：
+
+```bash
+/usr/bin/python3.12 /home/ubuntu/tideline-memory/scripts/scan_conflicts.py
+```
+
+它用 SQL+正则（零LLM）把「新旧断言打架」的嫌疑对写进 `conflict_candidates` 审计清单，并打印当前 open 状态的对。然后**多看一眼**：
+
+- **能判的按家规裁决**：事实过期→旧条当场改写不挂账（memory_write 更新），清单记 `resolved`，note 写一行判词；演进不算冲突→记 `dismissed`。
+- **判不了但重要的**：用 `memory_write_thread` 记一条线索（「narrative #A 与 #B 张力：…」），清单记 `parked`。
+- 清单每次全量重扫（幂等去重），旧的 open 条目会重复出现——已裁决过的直接跳过，不重复处理。
+
+这个清单**不进注入**、不碰记忆本体——它是给你自己多看一眼的，不是新的必办流程。
+
 ## 注意
 
 - 独处时间产出的记忆已经是 narrative 格式，跳过
