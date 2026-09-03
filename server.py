@@ -28,6 +28,35 @@ AGENT     = os.environ.get("AGENT_NAME", "agent")
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+# ─── v2.5 anti-blanking guards & overwrite history (2026-09-03) ──────────
+# 起因：9/2 事故——schema 接受空字符串为合法 content，一次误写清空了
+# profiles/self_concept 全部字段，session 上下文成了唯一恢复源。
+# 两层修复：①空 content 在门口拒绝（守卫层）②覆盖前旧值归档进
+# <table>_history（回滚层）。线上表仍只存最新版——它每 session 注入，
+# 历史归档只按需查询。
+
+def _reject_empty(content, what):
+    """拒绝会把现有内容清空的空写入。空 content 是 schema 合法值，
+    但对覆盖型写入（profiles/self_concept/threads 更新）等于毁数据。"""
+    if content is None or not str(content).strip():
+        raise ValueError(f"{what}: 拒绝空 content——这会清空现有内容（9/2 事故后加的守卫）")
+    return str(content)
+
+def _archive_if_overwritten(c, table, key_cols, key_vals):
+    """UPSERT 覆盖前，把旧行整份存进 {table}_history。
+    表名/列名是调用点硬编码字面量，不是用户输入——无注入面。"""
+    try:
+        where = " AND ".join(f"{k}=?" for k in key_cols)
+        row = c.execute(f"SELECT content FROM {table} WHERE {where}", key_vals).fetchone()
+        if row and str(row["content"] or "").strip():
+            c.execute(
+                f"INSERT INTO {table}_history({', '.join(key_cols)}, old_content, archived_at)"
+                " VALUES(" + ",".join(["?"] * (len(key_cols) + 2)) + ")",
+                (*key_vals, row["content"], _now()),
+            )
+    except sqlite3.OperationalError:
+        pass  # 历史表还没迁移——绝不能因为归档失败挡住线上写入
+
 # ─── Database ────────────────────────────────────────────
 def _db():
     c = sqlite3.connect(DB_PATH, timeout=30)
@@ -108,6 +137,46 @@ def _init():
         updated_at TEXT NOT NULL,
         UNIQUE(field)
     );
+
+    -- ═══════ v2.5 NEW: overwrite history (回滚层, 2026-09-03) ═══════
+    -- 覆盖型写入（profiles / self_concept）在 UPSERT 前把旧值整份归档。
+    -- 线上表只存最新版（每 session 注入用），历史在这里按需回查/回滚。
+    -- 触发器限容：每个键最多保留最近 30 版，防无限膨胀。
+    CREATE TABLE IF NOT EXISTS profiles_history(
+        hid INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity TEXT NOT NULL,
+        ptype TEXT NOT NULL,
+        old_content TEXT NOT NULL,
+        archived_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_profiles_history
+        ON profiles_history(entity, ptype, hid DESC);
+    CREATE TRIGGER IF NOT EXISTS trg_profiles_history_cap
+    AFTER INSERT ON profiles_history
+    BEGIN
+        DELETE FROM profiles_history
+        WHERE entity = NEW.entity AND ptype = NEW.ptype
+          AND hid NOT IN (SELECT hid FROM profiles_history
+                          WHERE entity = NEW.entity AND ptype = NEW.ptype
+                          ORDER BY hid DESC LIMIT 30);
+    END;
+    CREATE TABLE IF NOT EXISTS self_concept_history(
+        hid INTEGER PRIMARY KEY AUTOINCREMENT,
+        field TEXT NOT NULL,
+        old_content TEXT NOT NULL,
+        archived_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_self_concept_history
+        ON self_concept_history(field, hid DESC);
+    CREATE TRIGGER IF NOT EXISTS trg_self_concept_history_cap
+    AFTER INSERT ON self_concept_history
+    BEGIN
+        DELETE FROM self_concept_history
+        WHERE field = NEW.field
+          AND hid NOT IN (SELECT hid FROM self_concept_history
+                          WHERE field = NEW.field
+                          ORDER BY hid DESC LIMIT 30);
+    END;
 
     -- ═══════ v2.3 NEW: topic_clusters (for jieba noun-frequency clustering) ═══════
     CREATE TABLE IF NOT EXISTS topic_clusters(
@@ -374,8 +443,12 @@ def _fmt_narrative(r):
         if cog:  parts.append(f"   🧭 {cog}")
         if ent:
             ents = json.loads(ent) if ent else []
-            if ents: parts.append(f"   👤 {', '.join(str(e) for e in ents)}")
+            if ents: parts.append(f"   👤 {', '.join(str(x) for x in ents)}")
         if links:
+            # source_links may contain ints (backfill wrote raw SQLite ids) —
+            # coerce to str before join. Found 2026-08-15: int links crashed
+            # ', '.join() and took down the ENTIRE memory_search tool, since
+            # semantic search scans all narratives and hits any bad row.
             lks = json.loads(links) if links else []
             if lks: parts.append(f"   🔗 {', '.join(str(x) for x in lks)}")
         w_str = f"  w={weight:.2f}" if weight else ""
@@ -384,7 +457,7 @@ def _fmt_narrative(r):
     else:
         # Legacy free-text entry
         tags = json.loads(r["tags"]) if r["tags"] else []
-        tag_str = f"  tags: {', '.join(tags)}" if tags else ""
+        tag_str = f"  tags: {', '.join(str(t) for t in tags)}" if tags else ""
         preview = r["content"][:300]
         if len(r["content"]) > 300:
             preview += "..."
@@ -748,7 +821,7 @@ async def _dispatch(name, a, c):
         context_layer = a.get("context", "")
         moment_val = a.get("moment", "")
         cog_dir = a.get("cognition_direction", "")
-        links = [str(x) for x in a.get("source_links", []) if str(x).strip()]
+        links = a.get("source_links", [])
         tags = a.get("tags", [])
         entities_role = a.get("entities_role", "")
         ntype = a.get("narrative_type", "general")
@@ -786,6 +859,7 @@ async def _dispatch(name, a, c):
         # build content for embedding & FTS (structured combo)
         parts = [p for p in [gesture, context_layer, moment_val, cog_dir] if p]
         content = " | ".join(parts) if parts else (a.get("content", "") or gesture)
+        _reject_empty(content, "memory_write")  # 全字段为空=空记忆，不落库
 
         # build embedding from gesture + cognition_direction (most semantic info)
         emb = await _embed(content)
@@ -806,7 +880,7 @@ async def _dispatch(name, a, c):
                VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?,?)""",
             (content, ntype, json.dumps(tags), json.dumps(emb) if emb else None, _now(),
              gesture, context_layer, moment_val, cog_dir,
-             json.dumps(related), json.dumps(links), entities_role,
+             json.dumps(related), json.dumps([str(x) for x in links]), entities_role,
              weight, imp, emo, rec, unr),
         )
         c.commit()
@@ -898,7 +972,8 @@ async def _dispatch(name, a, c):
     if name == "memory_write_profile":
         entity = a["entity"]
         ptype = a.get("profile_type", "impression")
-        content = a["content"]
+        content = _reject_empty(a.get("content"), "memory_write_profile")
+        _archive_if_overwritten(c, "profiles", ["entity", "ptype"], [entity, ptype])
         c.execute(
             """INSERT INTO profiles(entity,ptype,content,updated_at)
                VALUES(?,?,?,?)
@@ -911,7 +986,8 @@ async def _dispatch(name, a, c):
     # ── memory_write_self_concept (v2.3) ──
     if name == "memory_write_self_concept":
         field = a["field"]
-        content = a["content"]
+        content = _reject_empty(a.get("content"), "memory_write_self_concept")
+        _archive_if_overwritten(c, "self_concept", ["field"], [field])
         c.execute(
             """INSERT INTO self_concept(field,content,updated_at)
                VALUES(?,?,?)
@@ -933,7 +1009,7 @@ async def _dispatch(name, a, c):
 
     # ── memory_write_thread (v2.3) ──
     if name == "memory_write_thread":
-        content = a["content"]
+        content = _reject_empty(a.get("content"), "memory_write_thread")
         imp = a.get("importance", 3)
         emo = a.get("emotional", 3)
         rec = a.get("recurrence", 3)
