@@ -194,6 +194,19 @@ def _init():
     );
     CREATE INDEX IF NOT EXISTS idx_amendments_nid ON amendments(narrative_id, created_at);
 
+    -- ═══════ v2.6 NEW: embedding_cache (语义层缓存, 2026-09-06) ═══════
+    -- 图纸：graphify 双层缓存的语义层复刻——按 prompt 指纹作废。
+    -- 键 = sha256(text) + 模型命名空间；换 embedding 模型 = 新命名空间，
+    -- 旧向量永远不会被新模型读到（防旧 bug 阴魂，同 AST 层思路）。
+    -- 花钱买的不轻易作废：文本没变就吃缓存。
+    CREATE TABLE IF NOT EXISTS embedding_cache(
+        text_hash TEXT NOT NULL,
+        model_ns TEXT NOT NULL,
+        vector TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(text_hash, model_ns)
+    );
+
     -- ═══════ v2.3 NEW: topic_clusters (for jieba noun-frequency clustering) ═══════
     CREATE TABLE IF NOT EXISTS topic_clusters(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -345,31 +358,73 @@ def _is_local_emb() -> bool:
     """True if embedding service is on localhost (no API key needed)."""
     return "localhost" in _EMB_URL or "127.0.0.1" in _EMB_URL
 
+def _cache_embedding(text_hash: str, model_ns: str, vec) -> None:
+    """v2.6: 烧完 API 落缓存。失败静默——缓存层绝不挡主路径。"""
+    try:
+        cc = _db()
+        try:
+            cc.execute(
+                "INSERT OR REPLACE INTO embedding_cache(text_hash, model_ns, vector, created_at)"
+                " VALUES(?,?,?,?)",
+                (text_hash, model_ns, json.dumps(vec), _now()),
+            )
+            cc.commit()
+        finally:
+            cc.close()
+    except Exception:
+        pass
+
 async def _embed(text: str, _retries: int = 3):
     """Return embedding vector via local bge-m3 or remote OpenAI-compatible API.
+
+    v2.6: 语义层缓存（graphify 双层缓存复刻）。键=text sha256+模型命名空间。
+    命中缓存直接返回（零网络）；未命中才烧 API，烧完落缓存。
+    缓存查询在无连接场景（测试/沙箱）静默跳过，不挡主路径。
 
     Includes retry logic — embedding server may be briefly unavailable.
     Logs to stderr on each failure so silent drops are visible.
     """
-    import httpx, asyncio as _aio
+    import httpx, asyncio as _aio, hashlib as _hl
+    text = text[:5000]
+    _tkey = _hl.sha256(text.encode("utf-8")).hexdigest()
+    _mns = _EMB_MODEL + ("|local" if _is_local_emb() else "|api")
+
+    # ── L1: 语义缓存命中 → 零网络返回 ──
+    try:
+        cc = _db()
+        try:
+            row = cc.execute(
+                "SELECT vector FROM embedding_cache WHERE text_hash=? AND model_ns=?",
+                (_tkey, _mns)).fetchone()
+            if row:
+                return json.loads(row["vector"])
+        finally:
+            cc.close()
+    except Exception:
+        pass  # 缓存层绝不能挡主路径——查询失败当 miss 处理
+
     last_err = None
     for attempt in range(_retries):
         try:
             headers = {}
             if _is_local_emb():
-                payload = {"texts": [text[:5000]]}
+                payload = {"texts": [text]}
                 async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
                     r = await cli.post(_EMB_URL, json=payload)
                     r.raise_for_status()
-                    return r.json()["embeddings"][0]
+                    vec = r.json()["embeddings"][0]
+                    _cache_embedding(_tkey, _mns, vec)
+                    return vec
             else:
                 headers["Authorization"] = f"Bearer {_EMB_KEY}"
-                payload = {"model": _EMB_MODEL, "input": text[:5000]}
+                payload = {"model": _EMB_MODEL, "input": text}
                 async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
                     r = await cli.post(_EMB_URL, json=payload, headers=headers)
                     r.raise_for_status()
                     data = r.json()
-                    return data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
+                    vec = data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
+                    _cache_embedding(_tkey, _mns, vec)
+                    return vec
         except Exception as e:
             last_err = e
             print(f"[memory-mcp] embed attempt {attempt+1}/{_retries} failed: {e}", file=sys.stderr)
