@@ -178,6 +178,22 @@ def _init():
                           ORDER BY hid DESC LIMIT 30);
     END;
 
+    -- ═══════ v2.6 NEW: amendments (修订层, 2026-09-06) ═══════
+    -- 条目不可变：narratives 永不 UPDATE 语义字段。
+    -- 修订 = 独立append-only表，按 narrative_id 关联，读取时叠层显示。
+    -- 过期理解不消失，新增的理解叠上去——看得见层次。
+    -- 同族先例：profiles_history(覆盖归档)/threads(探索线索)，本表是
+    -- 正向修订：不替换任何东西，只往上面加便签。
+    CREATE TABLE IF NOT EXISTS amendments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        narrative_id INTEGER NOT NULL,
+        amendment TEXT NOT NULL,
+        reason TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (narrative_id) REFERENCES narratives(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_amendments_nid ON amendments(narrative_id, created_at);
+
     -- ═══════ v2.3 NEW: topic_clusters (for jieba noun-frequency clustering) ═══════
     CREATE TABLE IF NOT EXISTS topic_clusters(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -424,8 +440,27 @@ def _log_attention_mcp(c, scored_results, source="mcp_search"):
         pass
 
 # ─── Formatting helpers ──────────────────────────────────
-def _fmt_narrative(r):
-    """v2.3: structured display — gesture is the headline, rest is detail."""
+def _fmt_narrative(r, c=None):
+    """v2.3: structured display — gesture is the headline, rest is detail.
+    v2.6: 修订层——若传入 cursor，叠加显示该条目的 amendments（按时序）。
+    三个调用方（recall/search×2）都有 c 在手，全部传进来。"""
+    def _amend_lines(nid):
+        if c is None:
+            return []
+        try:
+            arows = c.execute(
+                "SELECT amendment, reason, created_at FROM amendments"
+                " WHERE narrative_id = ? ORDER BY created_at", (nid,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # 旧库还没跑过 v2.6 迁移——显示不挡路
+        lines = []
+        for ar in arows:
+            body = ar["amendment"] if len(ar["amendment"]) <= 200 else ar["amendment"][:200] + "…"
+            why = f" ｜原因: {ar['reason']}" if ar["reason"] else ""
+            lines.append(f"   📝 修订{ar['created_at'][:10]}: {body}{why}")
+        return lines
+
     # Structured fields (may be NULL for legacy entries)
     gesture = r["gesture"] if "gesture" in r.keys() and r["gesture"] else None
     weight  = r["weight"]  if "weight"  in r.keys() and r["weight"]  is not None else None
@@ -453,6 +488,7 @@ def _fmt_narrative(r):
             if lks: parts.append(f"   🔗 {', '.join(str(x) for x in lks)}")
         w_str = f"  w={weight:.2f}" if weight else ""
         parts.append(f"   [{r['created_at']}]{w_str}")
+        parts.extend(_amend_lines(r["id"]))   # v2.6: 修订层叠在最底
         return "\n".join(parts)
     else:
         # Legacy free-text entry
@@ -461,7 +497,9 @@ def _fmt_narrative(r):
         preview = r["content"][:300]
         if len(r["content"]) > 300:
             preview += "..."
-        return f"[{r['created_at']}] [{r['ntype']}] {preview}{tag_str}"
+        base = f"[{r['created_at']}] [{r['ntype']}] {preview}{tag_str}"
+        amend = _amend_lines(r["id"])   # v2.6: 旧格式条目同样叠层
+        return "\n".join([base] + amend) if amend else base
 
 def _fmt_context(r):
     meta = json.loads(r["meta"]) if r["meta"] else {}
@@ -537,6 +575,36 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
             "required": ["gesture"],
+        },
+    ),
+
+    types.Tool(
+        name="memory_amend",
+        description=(
+            "📝 给既有记忆追加修订（amendment）——不是编辑。条目全不可变，"
+            "修订作为带时间戳的补层叠上去：过期理解不消失，看得见层次。"
+            "适用于：认知更新（'从X切换到Y'的Y变了）、纠错、补充后来才知道的事实。"
+            "绝对不要用它改写原条目的意思——要记录的是'我现在知道当时理解错了'，"
+            "不是抹掉当时的理解。跟 memory_write 的分工：write 造新记忆，"
+            "amend 给旧记忆贴新便签。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "narrative_id": {
+                    "type": "integer",
+                    "description": "要修订的叙事条目 id",
+                },
+                "amendment": {
+                    "type": "string",
+                    "description": "修订内容——第一人称，写现在怎么看这条记忆",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "修订触发源（新证据/她的纠正/时间证明…）",
+                },
+            },
+            "required": ["narrative_id", "amendment"],
         },
     ),
 
@@ -940,6 +1008,29 @@ async def _dispatch(name, a, c):
         return [types.TextContent(type="text",
             text=f"✅ 已记录。weight={weight:.2f} | 标签: {tags}")]
 
+    # ── memory_amend (v2.6) ──
+    if name == "memory_amend":
+        nid = a["narrative_id"]
+        amendment = _reject_empty(a.get("amendment"), "memory_amend")
+        reason = a.get("reason") or ""
+
+        # 目标必须存在——给不存在的记忆贴便签是静默丢数据
+        row = c.execute("SELECT id, gesture FROM narratives WHERE id = ?", (nid,)).fetchone()
+        if not row:
+            return [types.TextContent(type="text",
+                text=f"❌ 记忆 #{nid} 不存在。修订只能贴在已有条目上。")]
+
+        c.execute(
+            "INSERT INTO amendments(narrative_id, amendment, reason, created_at) VALUES(?,?,?,?)",
+            (nid, amendment, reason, _now()),
+        )
+        c.commit()
+        n = c.execute(
+            "SELECT COUNT(*) AS n FROM amendments WHERE narrative_id = ?", (nid,)
+        ).fetchone()["n"]
+        return [types.TextContent(type="text",
+            text=f"✅ 修订已叠加到 #{nid}（第{n}层）：{amendment[:80]}{'…' if len(amendment) > 80 else ''} | 原因: {reason or '未注明'}")]
+
     # ── memory_recall ──
     if name == "memory_recall":
         ntype = a.get("narrative_type")
@@ -960,7 +1051,7 @@ async def _dispatch(name, a, c):
             return [types.TextContent(type="text", text="📖 还没有记忆。用 memory_write 写第一条吧。")]
         lines = [f"📖 最近 {len(rows)} 条记忆：\n"]
         for r in rows:
-            lines.append(_fmt_narrative(r))
+            lines.append(_fmt_narrative(r, c))
         
         # ── Log recall as passive attention (browsing, no query) ──
         recall_scored = [(0.0, r) for r in rows]
@@ -1337,7 +1428,7 @@ async def _dispatch(name, a, c):
         nar_params.append(limit)
         nar_kw = c.execute(nar_sql, nar_params).fetchall()
         for r in nar_kw:
-            results.append((1.0, "🔑记忆", _fmt_narrative(r), 0.3))
+            results.append((1.0, "🔑记忆", _fmt_narrative(r, c), 0.3))
 
         # 3. Semantic search (supplements keyword matches, with time filter)
         nar_sem_hits = []  # collect semantic hits for attention tracking
@@ -1355,7 +1446,7 @@ async def _dispatch(name, a, c):
             for r in c.execute(nar_sem_sql, nar_sem_params).fetchall():
                 score = _cosine(emb, json.loads(r["embedding"]))
                 if score > 0.3:
-                    results.append((score, "🧠记忆", _fmt_narrative(r), 0))
+                    results.append((score, "🧠记忆", _fmt_narrative(r, c), 0))
                     nar_sem_hits.append((score, r))
 
             ctx_sem_sql = "SELECT * FROM context WHERE embedding IS NOT NULL"
