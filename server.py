@@ -1095,20 +1095,24 @@ async def _dispatch(name, a, c):
                 text=f"👁️ 注意力分布（{days}天）\n\n暂无数据。注意力追踪刚启用，需要几轮对话积累。")]
 
         total = sum(r["hits"] for r in rows)
-        lines = [f"👁️ 注意力分布（{days}天，共{total}次命中）\n"]
+        lines = [f"👁️ 注意力分布（{days}天，共{total}次命中）"]
+        lines.append("📖 读图须知：① 命中按行计——一次搜索会点亮几十条记忆，行数大≠被问得多；每晚约02:00(北京)有一次全库扫描（洒水车），看来源分布时请记住它的存在。② 时间戳为UTC，北京+8。③ 『从未照亮』按簇名口径——簇没亮过≠记忆本体没被照过，本体可能天天被别的路径扫到。")
+        lines.append("")
         for r in rows:
             pct = r["hits"] / total * 100
             bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
             avg = f"{r['avg_sim']:.2f}" if r["avg_sim"] else "N/A"
             lines.append(f"  {r['cluster_name']:20s} {bar} {r['hits']:4d} ({pct:4.1f}%) sim={avg}")
 
-        # ── Source breakdown (v2.4: active vs passive attention) ──
+        # ── Source breakdown (v2.5: dual-caliber — rows AND ≈calls) ──
         try:
             source_rows = c.execute("""
-                SELECT source, COUNT(*) as cnt FROM attention_log
+                SELECT source, COUNT(*) AS cnt, COUNT(DISTINCT created_at) AS calls
+                FROM attention_log
                 WHERE created_at > ? GROUP BY source ORDER BY cnt DESC
             """, (cutoff,)).fetchall()
             if source_rows and len(source_rows) > 1:
+                total_calls = sum(sr["calls"] for sr in source_rows) or 1
                 source_labels = {
                     "t1_prefetch": "T1语义检索（主动）",
                     "t0_inject": "T0权重注入（被动）",
@@ -1116,20 +1120,34 @@ async def _dispatch(name, a, c):
                     "mcp_recall": "MCP浏览（被动）",
                     "dream": "DREAM检索",
                 }
-                lines.append(f"\n  📊 来源分布:")
+                lines.append(f"\n  📊 来源分布（按行数 ｜ 按≈次数=时间戳去重）:")
                 for sr in source_rows:
                     pct = sr["cnt"] / total * 100
+                    cpct = sr["calls"] / total_calls * 100
                     label = source_labels.get(sr["source"], sr["source"])
-                    lines.append(f"    {label}: {sr['cnt']} ({pct:.1f}%)")
+                    lines.append(f"    {label}: {sr['cnt']}行 ({pct:.1f}%) ｜ ≈{sr['calls']}次 ({cpct:.1f}%)")
         except Exception:
             pass  # source column may not exist on older logs
 
-        # Detect deserts
-        all_clusters = c.execute("SELECT cluster_name FROM topic_clusters").fetchall()
-        lit = {r["cluster_name"] for r in rows}
-        deserts = [r[0] for r in all_clusters if r[0] not in lit]
+        # Detect deserts — fixed 2026-09-06: attention_log stores composite
+        # names ("jieba:词 | emb:#N,N,N"), topic_clusters stores plain words.
+        # The old direct `not in` compared mismatched namespaces and listed
+        # EVERY cluster as never-illuminated (3243/3243 at time of fix).
+        # Now: match on the word part, sort by noun_freq so meaningful
+        # deserts surface first, cap the list for readability.
+        all_clusters = c.execute(
+            "SELECT cluster_name, noun_freq FROM topic_clusters ORDER BY noun_freq DESC"
+        ).fetchall()
+        lit_words = set()
+        for r in rows:
+            name = r["cluster_name"]
+            if name.startswith("jieba:"):
+                lit_words.add(name[6:].split(" | ")[0].strip())
+        deserts = [r["cluster_name"] for r in all_clusters if r["cluster_name"] not in lit_words]
         if deserts:
-            lines.append(f"\n  ⚠ 从未被照亮: {', '.join(deserts)}")
+            shown = ", ".join(deserts[:50])
+            more = f" ……共{len(deserts)}个" if len(deserts) > 50 else ""
+            lines.append(f"\n  ⚠ 从未被照亮（{len(deserts)}/{len(all_clusters)}簇）: {shown}{more}")
 
         return [types.TextContent(type="text", text="\n".join(lines))]
 
