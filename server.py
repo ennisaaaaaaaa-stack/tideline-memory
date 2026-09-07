@@ -13,7 +13,7 @@ Environment variables:
   AGENT_NAME          Agent label for logs (default: "agent")
 """
 
-import os, sys, json, math, sqlite3
+import os, sys, json, math, sqlite3, hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -194,6 +194,41 @@ def _init():
     );
     CREATE INDEX IF NOT EXISTS idx_amendments_nid ON amendments(narrative_id, created_at);
 
+    -- ═══════ v2.7 NEW: amendment_vectors (修订语义边表, 2026-09-07) ═══════
+    -- 会审三司拍板（#391/#393/#397/#402）：修订进检索是义务，不是设计取舍。
+    -- 本体向量长在 narratives 行上（embedding 列）——修订向量不进本体行，
+    -- 挂边表：旧行不动、伪条目不入 narratives（聚类/实体图/列表页零污染）。
+    -- 任一命中（本体向量 or 修订向量）都召回原条目，检索侧按 narrative_id
+    -- 收敛取 max（得分定排序、时序定回显——两根轴分家，#395）。
+    CREATE TABLE IF NOT EXISTS amendment_vectors(
+        amendment_id INTEGER PRIMARY KEY,
+        narrative_id INTEGER NOT NULL,
+        text_hash TEXT NOT NULL,
+        model_ns TEXT NOT NULL,
+        vector TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (amendment_id) REFERENCES amendments(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_amvec_nid ON amendment_vectors(narrative_id);
+
+    -- ═══════ v2.7.1 NEW: amvec_cooldown (补铸失败分层冷却, 2026-09-08) ═══════
+    -- 13c 拍板（无名分层+鸣鸣认账+洄01:16交底）：错误分层，一刀解两头——
+    --   连接类失败（服务不可达/超时）→ scope='global' 全局歇：断网是服务级
+    --     状态，窗内一切补铸（查询路+批量路）直接跳过，第一条付一次失败
+    --     成本、窗口内其余全免（照照第13条①：查询路同步补铸的最坏 186s
+    --     不能每次命中都重烧）；
+    --   条目类失败（服务在但这条被拒）→ scope='amend:<id>' 一条一账：
+    --     一个坏条目不摁住全表（鸣鸣 01:09 的连坐钉）。
+    -- 批量路（DREAM 夜扫 nids=None）同一张表说了算（无名 01:10a）。
+    -- 曾有两个先行版本（amendment_id 键 / day+model_ns 键）双重定义互相
+    -- 静默吞掉（洄01:25 读档钉）——本版是按拍板重落的唯一正身。
+    CREATE TABLE IF NOT EXISTS amvec_cooldown(
+        scope TEXT NOT NULL,
+        model_ns TEXT NOT NULL,
+        failed_at TEXT NOT NULL,
+        PRIMARY KEY(scope, model_ns)
+    );
+
     -- ═══════ v2.6 NEW: embedding_cache (语义层缓存, 2026-09-06) ═══════
     -- 图纸：graphify 双层缓存的语义层复刻——按 prompt 指纹作废。
     -- 键 = sha256(text) + 模型命名空间；换 embedding 模型 = 新命名空间，
@@ -294,8 +329,183 @@ def _init():
         INSERT INTO narratives_fts(rowid, gesture, context_layer, cognition_direction, tags)
         VALUES (new.id, new.gesture, new.context_layer, new.cognition_direction, new.tags);
     END;
+
+    -- v2.7: 修订进检索（会审拍板 #391/#395/#397/#402/#404）——修订的
+    -- 关键词路有自己的 FTS 表：amendment 文本进索引、命中映射回原条目。
+    -- external-content 模式 + 触发器同步：amendments 表是普通表（好查询好
+    -- join），fts 只做倒排。rebuild 兜底老索引漂移（见 _ensure_amfts_sync）。
+    CREATE VIRTUAL TABLE IF NOT EXISTS amendments_fts
+        USING fts5(amendment, reason, content='amendments', content_rowid='id', tokenize='trigram');
+
+    CREATE TRIGGER IF NOT EXISTS am_fts_ai AFTER INSERT ON amendments BEGIN
+        INSERT INTO amendments_fts(rowid, amendment, reason)
+        VALUES (new.id, new.amendment, new.reason);
+    END;
+    CREATE TRIGGER IF NOT EXISTS am_fts_ad AFTER DELETE ON amendments BEGIN
+        INSERT INTO amendments_fts(amendments_fts, rowid, amendment, reason)
+        VALUES('delete', old.id, old.amendment, old.reason);
+    END;
+    CREATE TRIGGER IF NOT EXISTS am_fts_au AFTER UPDATE ON amendments BEGIN
+        INSERT INTO amendments_fts(amendments_fts, rowid, amendment, reason)
+        VALUES('delete', old.id, old.amendment, old.reason);
+        INSERT INTO amendments_fts(rowid, amendment, reason)
+        VALUES (new.id, new.amendment, new.reason);
+    END;
     """)
     c.commit(); c.close()
+
+def _ensure_amfts_sync(c):
+    """v2.7: amendments_fts 一致性对账（漂移即 rebuild）。
+
+    为什么不是触发器就够：外部写入（迁移脚本/手工 sqlite3）绕过触发器后，
+    external-content FTS 会静默漂移——查询不报错，只是少行。
+    为什么不是行数对账：external-content 模式下 COUNT(*) 穿透读内容表，
+    索引缺行时计数照样相等（真跑抓出来的，探针本身是空转）。
+    正典探针 = FTS5 integrity-check（rank=1 比对索引与内容表）：
+    不一致抛 DatabaseError → rebuild 一次。amendments 是稀有事件表，
+    全表扫的代价可忽略；rebuild 期间查询走 LIKE 兜底不受影响。
+    """
+    try:
+        c.execute("INSERT INTO amendments_fts(amendments_fts, rank) VALUES('integrity-check', 1)")
+        c.commit()
+    except sqlite3.DatabaseError:
+        try:
+            c.execute("INSERT INTO amendments_fts(amendments_fts) VALUES('rebuild')")
+            c.commit()
+        except Exception:
+            pass  # rebuild 也失败（表不存在等老库）——查询路有 LIKE 兜底，不挡路
+
+AMVEC_COOLDOWN_SECONDS = 900   # 第13条①：冷却窗 15 分钟
+AMVEC_BACKFILL_RETRIES = 1     # 13b：补铸是副业，不继承主业重试预算
+AMVEC_BACKFILL_TIMEOUT = 10.0  # 13b：1 次 × 10s 封顶（186s 是事故形状）
+_AMVEC_PROBE_TEXT = "amvec connectivity probe"  # 常量哨兵——进 embedding_cache 后零成本
+
+def _amvec_cooling_down(c, mns, now_ts=None):
+    """v2.7.1: 全局冷却窗（连接类失败）是否生效。scope='global' 一行
+    代表「embedding 服务此刻不可达」，窗内一切补铸直接跳过。"""
+    try:
+        row = c.execute(
+            "SELECT failed_at FROM amvec_cooldown WHERE scope='global' AND model_ns=?",
+            (mns,)).fetchone()
+        if not row:
+            return False
+        fa = int(c.execute("SELECT strftime('%s', ?)",
+                           (row["failed_at"],)).fetchone()[0])
+        if now_ts is None:
+            now_ts = int(c.execute("SELECT strftime('%s', ?)",
+                                   (_now(),)).fetchone()[0])
+        return (now_ts - fa) < AMVEC_COOLDOWN_SECONDS
+    except sqlite3.OperationalError:
+        return False  # 老库无表——不挡补铸
+
+def _amvec_amend_cooling(c, mns, aid):
+    """v2.7.1: 条目级冷却（条目类失败）——一条一账，不株连全表。"""
+    try:
+        row = c.execute(
+            "SELECT failed_at FROM amvec_cooldown WHERE scope=? AND model_ns=?",
+            (f"amend:{aid}", mns)).fetchone()
+        if not row:
+            return False
+        fa = int(c.execute("SELECT strftime('%s', ?)",
+                           (row["failed_at"],)).fetchone()[0])
+        now_ts = int(c.execute("SELECT strftime('%s', ?)",
+                               (_now(),)).fetchone()[0])
+        return (now_ts - fa) < AMVEC_COOLDOWN_SECONDS
+    except sqlite3.OperationalError:
+        return False
+
+async def _amvec_embed(text):
+    """v2.7.1: 补铸专用 embed——1 次重试 × 10s 超时封顶。
+
+    副业不继承主业预算（无名 01:10b）：查询路上的补铸若继承 _embed 的
+    3×60s 重试，挂起型断网下一次命中最坏 186s 全挂在查询延迟上。"""
+    return await _embed(text, _retries=AMVEC_BACKFILL_RETRIES,
+                        timeout=AMVEC_BACKFILL_TIMEOUT)
+
+def _amvec_record(c, scope, mns):
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO amvec_cooldown(scope, model_ns, failed_at)"
+            " VALUES(?,?,?)", (scope, mns, _now()))
+    except sqlite3.OperationalError:
+        pass  # 老库无表——记账失败不挡主路径
+
+async def _ensure_amvec_sync(c, nids=None, force=False):
+    """v2.7: 修订向量对账补铸（lazy 路的兜底）。
+
+    amendment 落地时铸向量失败（无网络/服务暂挂）不挡写入——这里补：
+    找出还没有当前模型命名空间向量的 amendment，逐条铸。
+    调用点：memory_amend 落地后（同条目补漏）、search 关键词命中后
+    （查询触发的 lazy——FTS/LIKE 当前置，没命中就不花这个钱，#383③）、
+    DREAM 夜扫 backfill（force=True：夜里批量补，翻得过冷却窗）。
+    铸不上（_embed 返回 None）静默跳过，下次再试。
+
+    v2.7.1 分层冷却（13c 拍板：连接类全局歇 + 条目类一条一账）：
+      失败鉴别用哨兵探针——条目铸失败时，用常量哨兵文本再探一次服务
+      （哨兵进 embedding_cache，之后是零成本缓存命中）：
+        哨兵也死 → 连接类：记 scope='global' 全局窗并立刻收手，
+          窗内一切补铸（查询路+批量路）跳过——断网期第一条付一次
+          失败成本、窗口内其余全免（照照13①：186s 不能每次命中重烧）；
+        哨兵活着 → 条目类：只记 scope='amend:<id>'，一个坏条目
+          不摁住全表（鸣鸣 01:09 连坐钉），别的照铸。
+      批量路（nids=None）进门先看同一张表（无名 01:10a）——全局窗
+      生效时夜扫前脚也歇；force=True 翻窗重试（夜里服务恢复了照补）。
+      有成功/没有漏铸可试 → 清窗（刚恢复的库立刻回到正常补铸）。
+    """
+    _mns = _EMB_MODEL + ("|local" if _is_local_emb() else "|api")
+    try:
+        if not force and _amvec_cooling_down(c, _mns):
+            return  # 全局冷却窗内——服务不可达，不烧预算，夜扫/恢复后再补
+        sql = ("SELECT a.id AS aid, a.narrative_id AS nid, a.amendment AS text"
+               " FROM amendments a")
+        params = []
+        if nids:
+            sql += f" WHERE a.narrative_id IN ({','.join('?' * len(nids))})"
+            params.extend(int(x) for x in nids)
+        tried = succeeded = 0
+        failed_aids = []
+        service_down = False
+        for row in c.execute(sql, params).fetchall():
+            if not force and _amvec_amend_cooling(c, _mns, row["aid"]):
+                continue  # 条目级窗内——这条修订上次被拒，跳过不重烧
+            has = c.execute(
+                "SELECT 1 FROM amendment_vectors WHERE amendment_id=? AND model_ns=?",
+                (row["aid"], _mns)).fetchone()
+            if has:
+                continue
+            tried += 1
+            vec = await _amvec_embed(row["text"])
+            if not vec:
+                probe = await _amvec_embed(_AMVEC_PROBE_TEXT)
+                if not probe:
+                    # 哨兵也死 = 连接类：全局歇，立刻收手不再烧
+                    _amvec_record(c, "global", _mns)
+                    service_down = True
+                    break
+                failed_aids.append(row["aid"])  # 哨兵活 = 条目类：一条一账
+                continue
+            _tkey = hashlib.sha256(row["text"].encode("utf-8")).hexdigest()
+            c.execute(
+                "INSERT OR REPLACE INTO amendment_vectors"
+                "(amendment_id, narrative_id, text_hash, model_ns, vector, created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (row["aid"], row["nid"], _tkey, _mns, json.dumps(vec), _now()))
+            succeeded += 1
+        c.commit()
+        if service_down:
+            return
+        # 冷却账分层记（13c）：有成功或没有漏铸可试 = 服务在工作 → 清窗；
+        # 只有条目类失败 → 删全局窗（服务在线），失败条目逐条记账。
+        if tried > 0:
+            if succeeded == tried:
+                c.execute("DELETE FROM amvec_cooldown WHERE model_ns=?", (_mns,))
+            else:
+                c.execute("DELETE FROM amvec_cooldown WHERE model_ns=?", (_mns,))
+                for aid in failed_aids:
+                    _amvec_record(c, f"amend:{aid}", _mns)
+            c.commit()
+    except Exception:
+        pass  # 补铸失败不挡任何主路径——下次调用再试
 
 # ─── v2.3 Migration ──────────────────────────────────────
 def _migrate_narratives(c):
@@ -359,7 +569,10 @@ def _is_local_emb() -> bool:
     return "localhost" in _EMB_URL or "127.0.0.1" in _EMB_URL
 
 def _cache_embedding(text_hash: str, model_ns: str, vec) -> None:
-    """v2.6: 烧完 API 落缓存。失败静默——缓存层绝不挡主路径。"""
+    """v2.6: 烧完 API 落缓存。失败静默——缓存层绝不挡主路径。
+    v2.7: 容量帽（会审挂账「embedding 无淘汰」）——超帽裁最旧，
+    bge-m3 1024 维一条 JSON 约 9KB，帽 20000 行 ≈ 180MB 上界，
+    活库实测 948 条 narratives、amendment 是稀有事件，够撑多年。"""
     try:
         cc = _db()
         try:
@@ -368,13 +581,21 @@ def _cache_embedding(text_hash: str, model_ns: str, vec) -> None:
                 " VALUES(?,?,?,?)",
                 (text_hash, model_ns, json.dumps(vec), _now()),
             )
+            # v2.7 容量帽：只裁当前模型命名空间的最旧行——换模型不烧旧账
+            cc.execute(
+                """DELETE FROM embedding_cache WHERE model_ns = ?
+                   AND created_at <= (
+                       SELECT created_at FROM embedding_cache WHERE model_ns = ?
+                       ORDER BY created_at DESC LIMIT 1 OFFSET 20000)""",
+                (model_ns, model_ns),
+            )
             cc.commit()
         finally:
             cc.close()
     except Exception:
         pass
 
-async def _embed(text: str, _retries: int = 3):
+async def _embed(text: str, _retries: int = 3, timeout: float = 60.0):
     """Return embedding vector via local bge-m3 or remote OpenAI-compatible API.
 
     v2.6: 语义层缓存（graphify 双层缓存复刻）。键=text sha256+模型命名空间。
@@ -495,22 +716,60 @@ def _log_attention_mcp(c, scored_results, source="mcp_search"):
         pass
 
 # ─── Formatting helpers ──────────────────────────────────
+def _amendments_for(nid, c):
+    """v2.7: 修订层的单一来源（#397「免得叠层逻辑散在多处」）。
+
+    显示层（_fmt_narrative 的 📝 行）和语义层（_effective_text）都从这取，
+    改叠层规则只改一处。同秒多条按 id 定序（鸣鸣挂账：同秒时序加 id 排序）。
+    """
+    if c is None:
+        return []
+    try:
+        return c.execute(
+            "SELECT amendment, reason, created_at FROM amendments"
+            " WHERE narrative_id = ? ORDER BY created_at, id", (nid,)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # 旧库还没跑过 v2.6 迁移——显示不挡路
+
+def _effective_text(nid, c):
+    """v2.7: 机读生效态（会审 #395/#397/#404）——本体 + 修订按时序叠成。
+
+    两层分工：_fmt_narrative 是显示层（原文+📝痕迹，看得见层次）；
+    这是语义层（这条记忆「现在到底说什么」）。DREAM 批量扫、外部机读
+    消费方、未来单条详情读取，都从这取。得分定排序、时序定回显——
+    回显的内容由时序叠层决定，跟哪条检索路径分高无关。
+    """
+    row = c.execute(
+        "SELECT content, gesture, context_layer FROM narratives WHERE id = ?", (nid,)
+    ).fetchone()
+    if not row:
+        return ""
+    base = row["gesture"] or row["content"] or ""
+    if row["context_layer"]:
+        base = f"{base} | {row['context_layer']}"
+    return "\n".join([base] + [a["amendment"] for a in _amendments_for(nid, c)])
+
+def _dedup_rows_by_id(rows):
+    """v2.7: 按 narrative_id 收敛行（FTS 与 LIKE 双写后的第一道去重；
+    search 末端的分数收敛见 memory_search 主体）。保首见顺序。"""
+    seen = set()
+    out = []
+    for r in rows:
+        rid = r["id"]
+        if rid not in seen:
+            seen.add(rid)
+            out.append(r)
+    return out
+
 def _fmt_narrative(r, c=None):
     """v2.3: structured display — gesture is the headline, rest is detail.
     v2.6: 修订层——若传入 cursor，叠加显示该条目的 amendments（按时序）。
-    三个调用方（recall/search×2）都有 c 在手，全部传进来。"""
+    三个调用方（recall/search×2）都有 c 在手，全部传进来。
+    v2.7: 叠层数据改走 _amendments_for 单一来源。"""
     def _amend_lines(nid):
-        if c is None:
-            return []
-        try:
-            arows = c.execute(
-                "SELECT amendment, reason, created_at FROM amendments"
-                " WHERE narrative_id = ? ORDER BY created_at", (nid,)
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return []  # 旧库还没跑过 v2.6 迁移——显示不挡路
         lines = []
-        for ar in arows:
+        for ar in _amendments_for(nid, c):
             body = ar["amendment"] if len(ar["amendment"]) <= 200 else ar["amendment"][:200] + "…"
             why = f" ｜原因: {ar['reason']}" if ar["reason"] else ""
             lines.append(f"   📝 修订{ar['created_at'][:10]}: {body}{why}")
@@ -1079,7 +1338,17 @@ async def _dispatch(name, a, c):
             "INSERT INTO amendments(narrative_id, amendment, reason, created_at) VALUES(?,?,?,?)",
             (nid, amendment, reason, _now()),
         )
+        # 修订本体先落盘——铸向量是增强不是前置条件，任何下游失败
+        # 都不能让用户看到「✅已叠加」而数据实际回滚（真跑自查抓的雷）。
         c.commit()
+        # v2.7: 修订落地即铸修订向量（边表）——修订进检索是义务。
+        # 走 _ensure_amvec_sync 单一来源：顺手把同条目历史漏铸的一起补上。
+        # 铸不上不挡修订写入——FTS 仍能命中，下次 amend/查询/DREAM 再补。
+        try:
+            await _ensure_amvec_sync(c, [nid])
+        except Exception:
+            pass
+
         n = c.execute(
             "SELECT COUNT(*) AS n FROM amendments WHERE narrative_id = ?", (nid,)
         ).fetchone()["n"]
@@ -1468,9 +1737,27 @@ async def _dispatch(name, a, c):
 
         # 1. Keyword search — context (FTS5 + LIKE fallback, with time filter)
         for r in _kw_search(c, query, limit=limit*2, time_filter=time_filter, time_params=time_params):
-            results.append((1.0, "🔑上下文", _fmt_context(r), 0.3))
+            results.append((1.0, "🔑上下文", _fmt_context(r), 0.3, None))
 
-        # 2. Keyword search — narratives (LIKE, with time filter)
+        # 2. Keyword search — narratives (v2.7: FTS + LIKE 双写；amendment 命中映射回原条目)
+        # narratives_fts 覆盖 gesture/context_layer/cognition_direction/tags 四列，
+        # content（拼好的结构化组合）不进 FTS——LIKE 兜底继续查它，两条一起
+        # 送到 dedup（照照：FTS/LIKE 两条一起补，别只补 FTS）。
+        try:
+            _ensure_amfts_sync(c)
+            nar_kw_fts_sql = """SELECT n.* FROM narratives_fts f
+                   JOIN narratives n ON n.id = f.rowid
+                   WHERE narratives_fts MATCH ?"""
+            nar_kw_fts_params = [f'"{query}"']
+            if since:
+                nar_kw_fts_sql += " AND n.created_at >= ?"
+                nar_kw_fts_params.append(since)
+            if until:
+                nar_kw_fts_sql += " AND n.created_at <= ?"
+                nar_kw_fts_params.append(until)
+            nar_kw_fts = c.execute(nar_kw_fts_sql, nar_kw_fts_params).fetchall()
+        except Exception:
+            nar_kw_fts = []
         nar_sql = "SELECT * FROM narratives WHERE content LIKE ?"
         nar_params = [f"%{query}%"]
         if since:
@@ -1481,9 +1768,53 @@ async def _dispatch(name, a, c):
             nar_params.append(until)
         nar_sql += " ORDER BY created_at DESC LIMIT ?"
         nar_params.append(limit)
-        nar_kw = c.execute(nar_sql, nar_params).fetchall()
+        nar_kw_like = c.execute(nar_sql, nar_params).fetchall()
+        nar_kw = _dedup_rows_by_id(nar_kw_fts + nar_kw_like)
         for r in nar_kw:
-            results.append((1.0, "🔑记忆", _fmt_narrative(r, c), 0.3))
+            results.append((1.0, "🔑记忆", _fmt_narrative(r, c), 0.3, r["id"]))
+
+        # 2b. v2.7: amendment 关键词命中（FTS）映射回原条目——修订进检索是义务
+        # FTS miss（含 <3 字短查询 trigram 够不着）与 FTS 异常同样走 LIKE 兜底
+        # ——_kw_search 同款模式：FTS 是快路不是唯一路。
+        am_hits = []
+        try:
+            am_fts_sql = """SELECT n.* FROM amendments_fts f
+                   JOIN amendments a ON a.id = f.rowid
+                   JOIN narratives n ON n.id = a.narrative_id
+                   WHERE amendments_fts MATCH ?"""
+            am_fts_params = [f'"{query}"']
+            if since:
+                am_fts_sql += " AND a.created_at >= ?"
+                am_fts_params.append(since)
+            if until:
+                am_fts_sql += " AND a.created_at <= ?"
+                am_fts_params.append(until)
+            am_hits = c.execute(am_fts_sql, am_fts_params).fetchall()
+        except Exception:
+            am_hits = []
+        if not am_hits:
+            am_like_sql = """SELECT n.* FROM narratives n JOIN amendments a ON a.narrative_id = n.id
+                   WHERE (a.amendment LIKE ? OR a.reason LIKE ?)"""
+            am_like_params = [f"%{query}%", f"%{query}%"]
+            if since:
+                am_like_sql += " AND a.created_at >= ?"
+                am_like_params.append(since)
+            if until:
+                am_like_sql += " AND a.created_at <= ?"
+                am_like_params.append(until)
+            am_like_sql += " ORDER BY a.created_at DESC LIMIT ?"
+            am_like_params.append(limit)
+            am_hits = c.execute(am_like_sql, am_like_params).fetchall()
+        am_kw = _dedup_rows_by_id(am_hits)
+        # 查询触发的 lazy 补铸（#383③/#431）：关键词命中修订 = 「值得现场铸」
+        # 的信号——没命中不花钱。铸不上不挡查询（_ensure_amvec_sync 自吞异常）。
+        if am_kw:
+            try:
+                await _ensure_amvec_sync(c, [r["id"] for r in am_kw])
+            except Exception:
+                pass
+        for r in am_kw:
+            results.append((1.0, "🔑记忆·修订", _fmt_narrative(r, c), 0.3, r["id"]))
 
         # 3. Semantic search (supplements keyword matches, with time filter)
         nar_sem_hits = []  # collect semantic hits for attention tracking
@@ -1501,8 +1832,32 @@ async def _dispatch(name, a, c):
             for r in c.execute(nar_sem_sql, nar_sem_params).fetchall():
                 score = _cosine(emb, json.loads(r["embedding"]))
                 if score > 0.3:
-                    results.append((score, "🧠记忆", _fmt_narrative(r, c), 0))
+                    results.append((score, "🧠记忆", _fmt_narrative(r, c), 0, r["id"]))
                     nar_sem_hits.append((score, r))
+
+            # 3b. v2.7: 修订向量路——边表扫描，命中映射回原条目。
+            # 旧向量不动（当时的错理解也是可检索的历史），任一命中都召回
+            # 原条目；末端按 narrative_id 收敛取 max（#391/#393）。
+            try:
+                amvec_sql = ("SELECT v.amendment_id, v.narrative_id, v.vector FROM"
+                             " amendment_vectors v")
+                amvec_params = []
+                if since:
+                    amvec_sql += " JOIN amendments a ON a.id = v.amendment_id AND a.created_at >= ?"
+                    amvec_params.append(since)
+                if until:
+                    amvec_sql += " JOIN amendments a2 ON a2.id = v.amendment_id AND a2.created_at <= ?"
+                    amvec_params.append(until)
+                for vr in c.execute(amvec_sql, amvec_params).fetchall():
+                    vscore = _cosine(emb, json.loads(vr["vector"]))
+                    if vscore > 0.3:
+                        row = c.execute(
+                            "SELECT * FROM narratives WHERE id = ?", (vr["narrative_id"],)
+                        ).fetchone()
+                        if row:
+                            results.append((vscore, "🧠记忆·修订", _fmt_narrative(row, c), 0, row["id"]))
+            except sqlite3.OperationalError:
+                pass  # 老库无 amendment_vectors——修订向量路静默跳过
 
             ctx_sem_sql = "SELECT * FROM context WHERE embedding IS NOT NULL"
             ctx_sem_params = []
@@ -1519,19 +1874,22 @@ async def _dispatch(name, a, c):
                 scored.append((_cosine(emb, json.loads(r["embedding"])), r))
             scored.sort(key=lambda x: -x[0])
             for score, r in scored[:limit]:
-                results.append((score, "🧠上下文", _fmt_context(r), 0))
+                results.append((score, "🧠上下文", _fmt_context(r), 0, None))
 
         if not results:
             return [types.TextContent(type="text", text=f"🔍 没找到和 \"{query}\" 相关的内容。")]
 
-        # Deduplicate by content preview, sort with keyword boost
-        seen = set()
-        deduped = []
-        for score, source_text, text, boost in results:
-            key = text[:80]
-            if key not in seen:
-                seen.add(key)
-                deduped.append((score, source_text, text, boost))
+        # v2.7 收敛：narrative 按 id 收敛取 max，不再按 text[:80]。
+        # 旧键的两种病（#386/#387）：修订动在80字后→修订行与原文行同形被吃；
+        # 同条目多路命中→靠占位次数顶位。收敛键换成 id 后连根治：
+        # 得分定排序、时序定回显（回显文本已在各路生成时走叠层格式，
+        # 带全部 📝 修订层——命中的不管是本体还是修订向量，吐的都是叠层生效态）。
+        best = {}  # key -> (score, source, text, boost)
+        for score, source, text, boost, rid in results:
+            key = ("n", rid) if rid is not None else ("c", text[:80])
+            if key not in best or (score + boost) > (best[key][0] + best[key][3]):
+                best[key] = (score, source, text, boost)
+        deduped = list(best.values())
         deduped.sort(key=lambda x: -(x[0] + x[3]))
         
         # ── Log memory_search narrative hits as attention ──

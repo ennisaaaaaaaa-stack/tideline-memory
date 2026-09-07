@@ -8,9 +8,10 @@ Three jobs:
 3. Weight normalization sweep (anti-inflation)
 
 Usage:
-  python3 scripts/dream_scripts.py clusters     # rebuild topic clusters
-  python3 scripts/dream_scripts.py weights      # backfill + normalize weights
-  python3 scripts/dream_scripts.py all          # run everything
+  python3 scripts/dream_scripts.py clusters        # rebuild topic clusters
+  python3 scripts/dream_scripts.py weights         # backfill + normalize weights
+  python3 scripts/dream_scripts.py amend-backfill  # v2.7.1: 补铸漏铸的修订向量 (DREAM 夜扫第三层)
+  python3 scripts/dream_scripts.py all             # run everything
 
 Runs independently of MCP server. Safe to run anytime.
 Requires: jieba (system python3.12)
@@ -20,8 +21,11 @@ import os, sys, json, sqlite3, re, math
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
-import jieba
-import jieba.posseg as pseg
+# jieba 延迟到函数内 import（01:43 会审钉）：三个子命令三条腿——
+# clusters/weights 要 jieba（system python3.12），amend-backfill 借
+# hermes venv 的 mcp/httpx（3.12 没有 mcp）。顶层 import 会让
+# amend-backfill 在任何没有 jieba 的解释器上直接 ModuleNotFoundError。
+
 
 DB_PATH = os.environ.get("MEMORY_MCP_DB", str(Path.home() / "memory" / "mcp_memory.db"))
 
@@ -167,6 +171,7 @@ def extract_keywords(text):
     keywords = []
     if not text:
         return keywords
+    import jieba.posseg as pseg  # lazy（01:43 会审钉）——clusters/weights 腿专用
     for word, flag in pseg.cut(text):
         w = word.strip()
         if not w:
@@ -474,6 +479,48 @@ def normalize_all():
         print(f"   {d['band']}: {d['n']}条")
 
 # ─── Main ────────────────────────────────────────────────
+def amend_vector_backfill():
+    """v2.7.1: DREAM 夜扫的修订向量兜底（lazy 三层的第三层）。
+
+    server.py 里的 _ensure_amvec_sync 是 async（MCP 侧），这里经
+    importlib 借正本的实现、用 asyncio.run 桥成同步——单一来源，
+    不在脚本层复刻补铸/冷却逻辑（复刻=第二本体=漂移温床）。
+    force=True：夜扫翻得过失败冷却窗——白天断网开的窗，夜里批量补。
+    依赖 embedding 服务（_embed）；服务不在=这条腿静默缺位，
+    不报错（夜扫其他腿照跑，prompt 层记一笔即可）。
+    """
+    import importlib.util, asyncio
+    server = os.environ.get("MEMORY_MCP_SERVER",
+                            "/home/ubuntu/tideline-memory/server.py")
+    spec = importlib.util.spec_from_file_location("memory_server_bf", server)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load server module: {server}")
+    srv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(srv)
+    c = _db()
+    try:
+        before = c.execute(
+            "SELECT COUNT(*) AS n FROM amendments a WHERE NOT EXISTS ("
+            " SELECT 1 FROM amendment_vectors v"
+            " WHERE v.amendment_id = a.id)").fetchone()["n"]
+        if before == 0:
+            print("✅ All amendment vectors present. Nothing to backfill.")
+            return
+        print(f"⏳ {before} amendments missing vectors, backfilling (force)…")
+        asyncio.run(srv._ensure_amvec_sync(c, None, force=True))
+        after = c.execute(
+            "SELECT COUNT(*) AS n FROM amendments a WHERE NOT EXISTS ("
+            " SELECT 1 FROM amendment_vectors v"
+            " WHERE v.amendment_id = a.id)").fetchone()["n"]
+        done = before - after
+        if done == before:
+            print(f"✅ Amendment vector backfill: {done} vectors cast.")
+        else:
+            print(f"⚠️ Backfilled {done}/{before}; {after} still missing "
+                  "(embedding service down? next DREAM sweep or query hit will retry).")
+    finally:
+        c.close()
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
 
@@ -489,8 +536,12 @@ if __name__ == "__main__":
         print("\n═══ Weight Normalization ═══")
         normalize_all()
 
+    if cmd in ("amend-backfill", "all"):
+        print("\n═══ Amendment Vector Backfill (v2.7.1) ═══")
+        amend_vector_backfill()
+
     if cmd == "all":
         print("\n✅ All scripts complete.")
-    elif cmd not in ("clusters", "weights", "recurrence"):
+    elif cmd not in ("clusters", "weights", "recurrence", "amend-backfill"):
         print(f"Unknown command: {cmd}")
-        print("Usage: python3 dream_scripts.py [clusters|weights|recurrence|all]")
+        print("Usage: python3 dream_scripts.py [clusters|weights|recurrence|amend-backfill|all]")
