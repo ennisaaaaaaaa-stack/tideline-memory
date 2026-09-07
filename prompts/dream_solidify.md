@@ -103,7 +103,15 @@ source_links: [56153, 56154, 56155]
 
 # embedding-space soft clustering（检索路由 + 注意力追踪）
 /usr/bin/python3.12 /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/soft_clusters.py build
+
+# v2.7.1 修订向量夜扫兜底（lazy 第三层）：批量补铸断网期漏铸的修订向量，
+# force 翻冷却窗。报「All amendment vectors present」=没有漏铸，正常。
+# 若报 embedding 服务不可用：记一笔不中断，明晚或下次查询命中会再试。
+# 解释器分工（01:43 会审钉）：amend-backfill 要 importlib 借 server.py 的
+# mcp/httpx——只有 hermes venv 齐（jieba 已挪函数内 lazy，不在此腿爆炸）；
+# clusters/weights 要 jieba——照旧 3.12。每条腿在自己的齐装解释器上跑。
+/home/ubuntu/.hermes/hermes-agent/venv/bin/python /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/dream_scripts.py amend-backfill
 ```
 
 两条都要跑。第一条管 DREAM 梳理层的主题图谱注入，第二条管检索路由和注意力分布。
-如果某条脚本报错，记录错误但不要中断——另一条独立运行。
+如果某条脚本报错，记录错误但不要中断——另一条独立运行。第三条（amend-backfill）是修订向量夜扫兜底：多数夜晚会直接报「没有漏铸」，那也是正常输出；它失败不影响前两条的成果。
