@@ -951,7 +951,7 @@ def _amendments_for(nid, c):
     except sqlite3.OperationalError:
         return []  # 旧库还没跑过 v2.6 迁移——显示不挡路
 
-def _effective_text(nid, c, tail_only=False):
+def _effective_text(nid, c, tail_only=False, as_list=False):
     """v2.7: 机读生效态（会审 #395/#397/#404）——本体 + 修订按时序叠成。
 
     两层分工：_fmt_narrative 是显示层（原文+📝痕迹，看得见层次）；
@@ -961,18 +961,24 @@ def _effective_text(nid, c, tail_only=False):
     v2.8收尾车：真接线（#400/#486拍板，2026-09-09）——三家消费方切换：
     search回显/recall回显的修订段、traj_promote list的生效态附文，
     都从这取修订尾（tail_only），修订叠层逻辑只此一处（#397单一来源）。
+    v2.8.1（#513）：as_list 形态——修订正文可含换行，join→split 往返
+    对位会错行（修订2显示成修订1的尾巴）。需要逐条对位的消费方
+    （显示层）直接吃列表，不经字符串往返。
     """
-    row = c.execute(
-        "SELECT content, gesture, context_layer FROM narratives WHERE id = ?", (nid,)
-    ).fetchone()
-    if not row:
-        return ""
-    base = row["gesture"] or row["content"] or ""
-    if row["context_layer"]:
-        base = f"{base} | {row['context_layer']}"
     if tail_only:
-        return "\n".join(a["amendment"] for a in _amendments_for(nid, c))
-    return "\n".join([base] + [a["amendment"] for a in _amendments_for(nid, c)])
+        parts = [a["amendment"] for a in _amendments_for(nid, c)]
+    else:
+        row = c.execute(
+            "SELECT content, gesture, context_layer FROM narratives WHERE id = ?", (nid,)
+        ).fetchone()
+        if not row:
+            parts = []
+        else:
+            base = row["gesture"] or row["content"] or ""
+            if row["context_layer"]:
+                base = f"{base} | {row['context_layer']}"
+            parts = [base] + [a["amendment"] for a in _amendments_for(nid, c)]
+    return parts if as_list else "\n".join(parts)
 
 def _dedup_rows_by_id(rows):
     """v2.7: 按 narrative_id 收敛行（FTS 与 LIKE 双写后的第一道去重；
@@ -998,10 +1004,12 @@ def _fmt_narrative(r, c=None):
         # 不该由机读出口背（拍板：按分布再调，不预设）。
         # 依赖方向：显示层吃语义层的输出——未来生效态逻辑变（过滤/重排/
         # 新cast），显示自动跟上，修订叠层语义只此一处（#397/#400）。
-        eff_tail = _effective_text(nid, c, tail_only=True)
-        bodies = eff_tail.split("\n") if eff_tail else []
+        # v2.8.1（#513）：改吃 as_list 列表形态——修订正文含换行时
+        # join→split 按行对位会错行，逐条对位不经字符串往返。
+        bodies = _effective_text(nid, c, tail_only=True, as_list=True)
+        amends = _amendments_for(nid, c)
         lines = []
-        for i, ar in enumerate(_amendments_for(nid, c)):
+        for i, ar in enumerate(amends):
             body = bodies[i] if i < len(bodies) else ar["amendment"]
             why = f" ｜原因: {ar['reason']}" if ar["reason"] else ""
             lines.append(f"   📝 修订{ar['created_at'][:10]}: {body}{why}")
