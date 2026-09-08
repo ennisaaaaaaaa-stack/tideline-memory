@@ -13,7 +13,7 @@ Environment variables:
   AGENT_NAME          Agent label for logs (default: "agent")
 """
 
-import os, sys, json, math, sqlite3, hashlib
+import os, sys, json, math, sqlite3, hashlib, re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -229,6 +229,28 @@ def _init():
         PRIMARY KEY(scope, model_ns)
     );
 
+    -- ═══════ v2.8 NEW: trajectories (轨迹压缩, 2026-09-08) ═══════
+    -- 甜心spec：命中带append的narrative，注入呈现轨迹而非append全文。
+    -- 「n天前，一句话事件＋想法 → n天前，一句话事件＋想法 → …」循环链。
+    -- 每段带原始narrative关键词（检索锚，顺手捞回全文）。
+    -- 三层铸造（继承v2.7 lazy模式）：
+    --   机械垫底：memory_amend 同事务重算 cast='mech'——任何时刻注入有轨迹
+    --   LLM升格：DREAM固化层夜扫 cast='mech' → 自然语言事件链 cast='llm'
+    --             （「想法」层必须LLM，纯机械拼接出不来）
+    --   渲染层算「N天前」：存储保真绝对ts，注入时人性化相对时间
+    -- 新amend → 整条轨迹回 mech 重升格（故事重讲，不做段级混合cast）。
+    -- v2.6铁律：不碰narratives行——轨迹独立存储，PK=narrative_id 1:1。
+    CREATE TABLE IF NOT EXISTS trajectories(
+        narrative_id INTEGER PRIMARY KEY,
+        traj_json TEXT NOT NULL,          -- JSON [{ts, text}, ...] 按时序
+        n_events INTEGER NOT NULL DEFAULT 0,
+        latest_amendment_id INTEGER,      -- 指纹：轨迹覆盖到的最后一条amend
+        cast_state TEXT NOT NULL DEFAULT 'mech',  -- mech | llm（cast是SQL保留字）
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_traj_pending ON trajectories(cast_state);
+
     -- ═══════ v2.6 NEW: embedding_cache (语义层缓存, 2026-09-06) ═══════
     -- 图纸：graphify 双层缓存的语义层复刻——按 prompt 指纹作废。
     -- 键 = sha256(text) + 模型命名空间；换 embedding 模型 = 新命名空间，
@@ -354,6 +376,164 @@ def _init():
     """)
     c.commit(); c.close()
 
+# ─── v2.8 Trajectory (轨迹压缩) ───────────────────────────
+# 甜心spec：注入命中带append的narrative → 呈现轨迹链而非append全文。
+# 三层：机械垫底（写入同事务）→ LLM升格（DREAM夜扫）→ 渲染相对时间（注入时）。
+
+TRAJ_MECH_CLIP = 80   # 机械段文本截断——垫底层是保真不是终态
+TRAJ_EVENT_CAP = 12   # 轨迹链事件数上限——注入轻量化（甜心：注入别抢context window）
+
+def _extract_traj_anchor(gesture, tags_json):
+    """v2.8: 从原narrative提取检索锚关键词（每段叙述都带，顺手捞回全文）。
+
+    锚 = gesture的头几个实词 + tags里的实词tag。机械提取，不完美但可捞：
+    轨迹段被读到时，锚词是 memory_search 的天然query。
+    """
+    words = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', gesture or "")
+    anchor_words = words[:3]
+    try:
+        tags = json.loads(tags_json) if tags_json else []
+    except (json.JSONDecodeError, TypeError):
+        tags = []
+    for t in tags[:4]:
+        t = str(t)
+        if len(t) >= 2 and t not in anchor_words:
+            anchor_words.append(t)
+    return "、".join(anchor_words[:5])
+
+def _rebuild_traj_mech(c, nid):
+    """v2.8 机械垫底层：narrative本体+全部amendments → 轨迹JSON。
+
+    每段 = {ts, text}。本体段ts=created_at，amend段ts=amend.created_at。
+    段文本：本体段=gesture截断+锚；amend段=amendment截断+锚。
+    纯机械零LLM零网络——memory_amend同事务调用，任何时刻注入有轨迹可读。
+    已有llm升格的轨迹被新amend作废：整条回mech（故事重讲语义，#决策④）。
+    幂等：按narrative_id全量重算覆盖。
+    """
+    row = c.execute(
+        "SELECT id, gesture, content, tags, created_at FROM narratives WHERE id = ?",
+        (nid,)).fetchone()
+    if not row:
+        return None
+    anchor = _extract_traj_anchor(row["gesture"] or row["content"] or "", row["tags"])
+    events = []
+    g = (row["gesture"] or row["content"] or "").strip()
+    if g:
+        events.append({"ts": row["created_at"],
+                       "text": (g[:TRAJ_MECH_CLIP] + ("…" if len(g) > TRAJ_MECH_CLIP else ""))
+                               + (f"（锚：{anchor}）" if anchor else "")})
+    for ar in _amendments_for(nid, c):
+        t = (ar["amendment"] or "").strip()
+        if not t:
+            continue
+        events.append({"ts": ar["created_at"],
+                       "text": (t[:TRAJ_MECH_CLIP] + ("…" if len(t) > TRAJ_MECH_CLIP else ""))
+                               + (f"（锚：{anchor}）" if anchor else "")})
+    # 截断方向=保最新（与渲染层一致）；n_events记原始总数，渲染层算「更早N段略」
+    n_total = len(events)
+    events = events[-TRAJ_EVENT_CAP:]
+    latest_aid = c.execute(
+        "SELECT MAX(id) AS m FROM amendments WHERE narrative_id = ?", (nid,)).fetchone()["m"]
+    now = _now()
+    traj = json.dumps(events, ensure_ascii=False)
+    c.execute(
+        """INSERT INTO trajectories(narrative_id, traj_json, n_events,
+               latest_amendment_id, cast_state, created_at, updated_at)
+           VALUES(?,?,?,?, 'mech', ?, ?)
+           ON CONFLICT(narrative_id) DO UPDATE SET
+               traj_json=excluded.traj_json, n_events=excluded.n_events,
+               latest_amendment_id=excluded.latest_amendment_id,
+               cast_state='mech', updated_at=excluded.updated_at""",
+        (nid, traj, n_total, latest_aid, now, now))
+    return n_total
+
+def _traj_pending(c, limit=50):
+    """v2.8: DREAM升格候选——cast='mech' 的轨迹（LLM夜扫入口）。"""
+    try:
+        return c.execute(
+            "SELECT narrative_id, n_events FROM trajectories"
+            " WHERE cast_state='mech' ORDER BY updated_at DESC LIMIT ?",
+            (limit,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+def _save_traj_llm(c, nid, events):
+    """v2.8 LLM升格层落盘：DREAM产出的自然语言事件链写回。
+
+    events = [{ts, text}, ...]（text已是「一句话事件＋想法」自然语言）。
+    校验失败（空/畸形）不落盘——mech垫底还在，注入不受影响。
+    """
+    if not events:
+        return False
+    clean = []
+    for ev in events:
+        t = str(ev.get("text", "")).strip()
+        ts = str(ev.get("ts", "")).strip()
+        if t and ts:
+            clean.append({"ts": ts, "text": t})
+    if not clean:
+        return False
+    latest_aid = c.execute(
+        "SELECT MAX(id) AS m FROM amendments WHERE narrative_id = ?", (nid,)).fetchone()["m"]
+    # 保最新cap段；n_events记原始总数（渲染层算「更早N段略」）
+    n_total = len(clean)
+    stored = clean[-TRAJ_EVENT_CAP:]
+    c.execute(
+        """UPDATE trajectories SET traj_json=?, n_events=?, latest_amendment_id=?,
+               cast_state='llm', updated_at=? WHERE narrative_id=?""",
+        (json.dumps(stored, ensure_ascii=False), n_total,
+         latest_aid, _now(), nid))
+    return True
+
+def _trajectory_render(c, nid, max_events=None, relative=True):
+    """v2.8 渲染层：轨迹JSON → 「n天前，事件 → n天前，事件」自然语言链。
+
+    注入=回忆（纯自然语言）原则：相对时间（今天/昨天/N天前），零技术元数据。
+    供 provider 注入与 MCP 查询侧共用；MCP 侧传 relative=False 保绝对时间。
+    截断策略：链过长时保留最新 max_events 段（老事件被压缩进轨迹本身就是
+    轨迹压缩的意义），尾部注「更早N段略」——不静默截断。
+    """
+    try:
+        row = c.execute(
+            "SELECT traj_json, n_events FROM trajectories WHERE narrative_id=?",
+            (nid,)).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    if not row:
+        return ""
+    try:
+        events = json.loads(row["traj_json"])
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not events:
+        return ""
+    total = row["n_events"] or len(events)
+    cap = max_events or TRAJ_EVENT_CAP
+    # n_events=历史总事件数；traj_json=最新cap段。dropped=被压缩掉的早期事件数
+    dropped = max(0, total - len(events))
+    now_ts = int(c.execute("SELECT strftime('%s','now')").fetchone()[0])
+    parts = []
+    for ev in events:
+        ts = ev.get("ts", "")
+        text = ev.get("text", "")
+        if not text:
+            continue
+        when = ts
+        if relative and ts:
+            try:
+                ev_ts = int(c.execute("SELECT strftime('%s', ?)", (ts,)).fetchone()[0])
+                days = max(0, (now_ts - ev_ts) // 86400)
+                when = "今天" if days == 0 else ("昨天" if days == 1 else f"{days}天前")
+            except (TypeError, ValueError, sqlite3.DatabaseError):
+                when = ts[:10]
+        parts.append(f"{when}，{text}")
+    if not parts:
+        return ""
+    out = " → ".join(parts)
+    if dropped:
+        out += f"（更早{dropped}段略）"
+    return out
+
 def _ensure_amfts_sync(c):
     """v2.7: amendments_fts 一致性对账（漂移即 rebuild）。
 
@@ -378,7 +558,7 @@ def _ensure_amfts_sync(c):
 AMVEC_COOLDOWN_SECONDS = 900   # 第13条①：冷却窗 15 分钟
 AMVEC_BACKFILL_RETRIES = 1     # 13b：补铸是副业，不继承主业重试预算
 AMVEC_BACKFILL_TIMEOUT = 10.0  # 13b：1 次 × 10s 封顶（186s 是事故形状）
-_AMVEC_PROBE_TEXT = "amvec connectivity probe"  # 常量哨兵——进 embedding_cache 后零成本
+_AMVEC_PROBE_TEXT = "amvec connectivity probe"  # 常量哨兵——探针 cache=False 绕 L1 真探（鸣鸣P2：进缓存=稳态活虫）
 
 def _amvec_cooling_down(c, mns, now_ts=None):
     """v2.7.1: 全局冷却窗（连接类失败）是否生效。scope='global' 一行
@@ -414,13 +594,14 @@ def _amvec_amend_cooling(c, mns, aid):
     except sqlite3.OperationalError:
         return False
 
-async def _amvec_embed(text):
+async def _amvec_embed(text, cache: bool = True):
     """v2.7.1: 补铸专用 embed——1 次重试 × 10s 超时封顶。
 
     副业不继承主业预算（无名 01:10b）：查询路上的补铸若继承 _embed 的
-    3×60s 重试，挂起型断网下一次命中最坏 186s 全挂在查询延迟上。"""
+    3×60s 重试，挂起型断网下一次命中最坏 186s 全挂在查询延迟上。
+    cache=False 供哨兵探针——绕 L1、不落缓存，每次都是真探。"""
     return await _embed(text, _retries=AMVEC_BACKFILL_RETRIES,
-                        timeout=AMVEC_BACKFILL_TIMEOUT)
+                        timeout=AMVEC_BACKFILL_TIMEOUT, cache=cache)
 
 def _amvec_record(c, scope, mns):
     try:
@@ -429,6 +610,37 @@ def _amvec_record(c, scope, mns):
             " VALUES(?,?,?)", (scope, mns, _now()))
     except sqlite3.OperationalError:
         pass  # 老库无表——记账失败不挡主路径
+
+def _amvec_scan(c, since=None, until=None):
+    """v2.7.2: 修订向量扫描路（search 3b）——按当前模型命名空间过滤。
+
+    WHERE v.model_ns=?（鸣鸣P3）：换 embedding 模型后旧空间向量参与
+    cosine 是噪声命中，model_ns 列设计出来就是等着过滤的。
+    JOIN amendments 是时间窗（since/until），不是过滤条件。"""
+    sql = "SELECT v.amendment_id, v.narrative_id, v.vector FROM amendment_vectors v"
+    params = []
+    if since:
+        sql += " JOIN amendments a ON a.id = v.amendment_id AND a.created_at >= ?"
+        params.append(since)
+    if until:
+        sql += " JOIN amendments a2 ON a2.id = v.amendment_id AND a2.created_at <= ?"
+        params.append(until)
+    sql += " WHERE v.model_ns = ?"
+    params.append(_EMB_MODEL + ("|local" if _is_local_emb() else "|api"))
+    return c.execute(sql, params).fetchall()
+
+def _amvec_cosine_hits(c, emb, since=None, until=None, threshold=0.3):
+    """v2.7.2: 扫描+cosine+映射回原条目。返回 [(score, row), ...]。"""
+    hits = []
+    for vr in _amvec_scan(c, since, until):
+        vscore = _cosine(emb, json.loads(vr["vector"]))
+        if vscore > threshold:
+            row = c.execute(
+                "SELECT * FROM narratives WHERE id = ?", (vr["narrative_id"],)
+            ).fetchone()
+            if row:
+                hits.append((vscore, row))
+    return hits
 
 async def _ensure_amvec_sync(c, nids=None, force=False):
     """v2.7: 修订向量对账补铸（lazy 路的兜底）。
@@ -442,7 +654,8 @@ async def _ensure_amvec_sync(c, nids=None, force=False):
 
     v2.7.1 分层冷却（13c 拍板：连接类全局歇 + 条目类一条一账）：
       失败鉴别用哨兵探针——条目铸失败时，用常量哨兵文本再探一次服务
-      （哨兵进 embedding_cache，之后是零成本缓存命中）：
+      （哨兵探针 cache=False 绕 L1 真探——进缓存反而成稳态活虫：断网后
+        L1 永远命中、探针永远「活着」，全局窗永远不再开【鸣鸣P2 复现坐实】）：
         哨兵也死 → 连接类：记 scope='global' 全局窗并立刻收手，
           窗内一切补铸（查询路+批量路）跳过——断网期第一条付一次
           失败成本、窗口内其余全免（照照13①：186s 不能每次命中重烧）；
@@ -476,7 +689,7 @@ async def _ensure_amvec_sync(c, nids=None, force=False):
             tried += 1
             vec = await _amvec_embed(row["text"])
             if not vec:
-                probe = await _amvec_embed(_AMVEC_PROBE_TEXT)
+                probe = await _amvec_embed(_AMVEC_PROBE_TEXT, cache=False)
                 if not probe:
                     # 哨兵也死 = 连接类：全局歇，立刻收手不再烧
                     _amvec_record(c, "global", _mns)
@@ -595,12 +808,15 @@ def _cache_embedding(text_hash: str, model_ns: str, vec) -> None:
     except Exception:
         pass
 
-async def _embed(text: str, _retries: int = 3, timeout: float = 60.0):
+async def _embed(text: str, _retries: int = 3, timeout: float = 60.0,
+                cache: bool = True):
     """Return embedding vector via local bge-m3 or remote OpenAI-compatible API.
 
     v2.6: 语义层缓存（graphify 双层缓存复刻）。键=text sha256+模型命名空间。
     命中缓存直接返回（零网络）；未命中才烧 API，烧完落缓存。
     缓存查询在无连接场景（测试/沙箱）静默跳过，不挡主路径。
+    v2.7.2: cache=False 供探针——绕 L1 也不落缓存（哨兵进缓存=稳态活虫）。
+    timeout 参数此前是摆设——httpx.AsyncClient 写死 60（照照P1/鸣鸣复审）。
 
     Includes retry logic — embedding server may be briefly unavailable.
     Logs to stderr on each failure so silent drops are visible.
@@ -610,19 +826,20 @@ async def _embed(text: str, _retries: int = 3, timeout: float = 60.0):
     _tkey = _hl.sha256(text.encode("utf-8")).hexdigest()
     _mns = _EMB_MODEL + ("|local" if _is_local_emb() else "|api")
 
-    # ── L1: 语义缓存命中 → 零网络返回 ──
-    try:
-        cc = _db()
+    # ── L1: 语义缓存命中 → 零网络返回（cache=False 探针绕过）──
+    if cache:
         try:
-            row = cc.execute(
-                "SELECT vector FROM embedding_cache WHERE text_hash=? AND model_ns=?",
-                (_tkey, _mns)).fetchone()
-            if row:
-                return json.loads(row["vector"])
-        finally:
-            cc.close()
-    except Exception:
-        pass  # 缓存层绝不能挡主路径——查询失败当 miss 处理
+            cc = _db()
+            try:
+                row = cc.execute(
+                    "SELECT vector FROM embedding_cache WHERE text_hash=? AND model_ns=?",
+                    (_tkey, _mns)).fetchone()
+                if row:
+                    return json.loads(row["vector"])
+            finally:
+                cc.close()
+        except Exception:
+            pass  # 缓存层绝不能挡主路径——查询失败当 miss 处理
 
     last_err = None
     for attempt in range(_retries):
@@ -630,21 +847,23 @@ async def _embed(text: str, _retries: int = 3, timeout: float = 60.0):
             headers = {}
             if _is_local_emb():
                 payload = {"texts": [text]}
-                async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
+                async with httpx.AsyncClient(trust_env=False, timeout=timeout) as cli:
                     r = await cli.post(_EMB_URL, json=payload)
                     r.raise_for_status()
                     vec = r.json()["embeddings"][0]
-                    _cache_embedding(_tkey, _mns, vec)
+                    if cache:
+                        _cache_embedding(_tkey, _mns, vec)
                     return vec
             else:
                 headers["Authorization"] = f"Bearer {_EMB_KEY}"
                 payload = {"model": _EMB_MODEL, "input": text}
-                async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
+                async with httpx.AsyncClient(trust_env=False, timeout=timeout) as cli:
                     r = await cli.post(_EMB_URL, json=payload, headers=headers)
                     r.raise_for_status()
                     data = r.json()
                     vec = data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
-                    _cache_embedding(_tkey, _mns, vec)
+                    if cache:
+                        _cache_embedding(_tkey, _mns, vec)
                     return vec
         except Exception as e:
             last_err = e
@@ -773,6 +992,11 @@ def _fmt_narrative(r, c=None):
             body = ar["amendment"] if len(ar["amendment"]) <= 200 else ar["amendment"][:200] + "…"
             why = f" ｜原因: {ar['reason']}" if ar["reason"] else ""
             lines.append(f"   📝 修订{ar['created_at'][:10]}: {body}{why}")
+        # v2.8: 轨迹链（MCP查询侧=翻笔记，绝对时间保层次）。
+        # 只有轨迹存在才显示——无append的narrative零开销。
+        t = _trajectory_render(c, nid, relative=False)
+        if t:
+            lines.append(f"   🧭 轨迹: {t}")
         return lines
 
     # Structured fields (may be NULL for legacy entries)
@@ -919,6 +1143,43 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
             "required": ["narrative_id", "amendment"],
+        },
+    ),
+
+    types.Tool(
+        name="memory_traj_promote",
+        description=(
+            "🧭 [DREAM固化层] 轨迹升格：把机械垫底轨迹重写成自然语言事件链。"
+            "每晚固化层调用——列出cast='mech'的待升格轨迹，读原narrative和"
+            "全部amendment，把「时间戳+截断文本」重写成「n天前，一句话事件＋"
+            "想法（带原始关键词）」的循环链。每段必须保留原始narrative的关键词"
+            "作为检索锚（捞回全文的入口）。写法：第一人称，存温度，不是机械摘要。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "write"],
+                    "description": "list=查待升格轨迹清单；write=写回升格后的轨迹",
+                },
+                "narrative_id": {
+                    "type": "integer",
+                    "description": "write时必填：目标条目id",
+                },
+                "events": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ts": {"type": "string", "description": "事件时间戳（保持原段ts不变）"},
+                            "text": {"type": "string", "description": "一句话事件＋想法，带原始关键词锚"},
+                        },
+                    },
+                    "description": "write时必填：升格后的轨迹事件链[{ts,text}]",
+                },
+            },
+            "required": ["action"],
         },
     ),
 
@@ -1348,12 +1609,57 @@ async def _dispatch(name, a, c):
             await _ensure_amvec_sync(c, [nid])
         except Exception:
             pass
+        # v2.8: 修订落地同事务重算机械轨迹（垫底层）——任何时刻注入有轨迹。
+        # 已有llm升格被新amend作废回mech，等DREAM夜扫重升格（故事重讲）。
+        try:
+            _rebuild_traj_mech(c, nid)
+            c.commit()
+        except Exception:
+            pass  # 轨迹失败不挡修订——下次amend/DREAM再补
 
         n = c.execute(
             "SELECT COUNT(*) AS n FROM amendments WHERE narrative_id = ?", (nid,)
         ).fetchone()["n"]
         return [types.TextContent(type="text",
             text=f"✅ 修订已叠加到 #{nid}（第{n}层）：{amendment[:80]}{'…' if len(amendment) > 80 else ''} | 原因: {reason or '未注明'}")]
+
+    # ── memory_traj_promote (v2.8 DREAM升格层) ──
+    if name == "memory_traj_promote":
+        action = a.get("action")
+        if action == "list":
+            rows = _traj_pending(c, limit=50)
+            if not rows:
+                return [types.TextContent(type="text",
+                    text="🧭 没有待升格的轨迹（全部已是llm或还没有轨迹）。")]
+            lines = ["🧭 待升格轨迹（cast='mech'）：\n"]
+            for r in rows:
+                # 附上机械轨迹内容供DREAM直接读——省一次查询
+                rendered = _trajectory_render(c, r["narrative_id"], relative=False)
+                lines.append(f"#{r['narrative_id']}（{r['n_events']}段）: {rendered}")
+            return [types.TextContent(type="text", text="\n\n".join(lines))]
+        if action == "write":
+            nid = a.get("narrative_id")
+            events = a.get("events")
+            if nid is None or not events:
+                return [types.TextContent(type="text",
+                    text="❌ write 需要 narrative_id 和 events。")]
+            # 目标必须存在且当前是mech——llm→llm覆盖是异常路径：
+            # 正常流里新amend已把旧llm作废回mech，llm态收到write=重复升格。
+            row = c.execute(
+                "SELECT cast_state FROM trajectories WHERE narrative_id = ?", (nid,)).fetchone()
+            if not row:
+                return [types.TextContent(type="text",
+                    text=f"❌ #{nid} 没有轨迹可升格（先amend产生机械轨迹）。")]
+            if row["cast_state"] != "mech":
+                return [types.TextContent(type="text",
+                    text=f"⏭️ #{nid} 已是llm轨迹，跳过（新amend会作废回mech再升格）。")]
+            ok = _save_traj_llm(c, nid, events)
+            c.commit()
+            if ok:
+                return [types.TextContent(type="text",
+                    text=f"✅ 轨迹已升格为llm（#{nid}，{len(events)}段）。")]
+            return [types.TextContent(type="text",
+                text="❌ 轨迹校验失败（空事件/畸形）——mech垫底保留，注入不受影响。")]
 
     # ── memory_recall ──
     if name == "memory_recall":
@@ -1838,24 +2144,10 @@ async def _dispatch(name, a, c):
             # 3b. v2.7: 修订向量路——边表扫描，命中映射回原条目。
             # 旧向量不动（当时的错理解也是可检索的历史），任一命中都召回
             # 原条目；末端按 narrative_id 收敛取 max（#391/#393）。
+            # v2.7.2: 扫描抽成 _amvec_scan，按 model_ns 过滤（鸣鸣P3）。
             try:
-                amvec_sql = ("SELECT v.amendment_id, v.narrative_id, v.vector FROM"
-                             " amendment_vectors v")
-                amvec_params = []
-                if since:
-                    amvec_sql += " JOIN amendments a ON a.id = v.amendment_id AND a.created_at >= ?"
-                    amvec_params.append(since)
-                if until:
-                    amvec_sql += " JOIN amendments a2 ON a2.id = v.amendment_id AND a2.created_at <= ?"
-                    amvec_params.append(until)
-                for vr in c.execute(amvec_sql, amvec_params).fetchall():
-                    vscore = _cosine(emb, json.loads(vr["vector"]))
-                    if vscore > 0.3:
-                        row = c.execute(
-                            "SELECT * FROM narratives WHERE id = ?", (vr["narrative_id"],)
-                        ).fetchone()
-                        if row:
-                            results.append((vscore, "🧠记忆·修订", _fmt_narrative(row, c), 0, row["id"]))
+                for vscore, row in _amvec_cosine_hits(c, emb, since, until):
+                    results.append((vscore, "🧠记忆·修订", _fmt_narrative(row, c), 0, row["id"]))
             except sqlite3.OperationalError:
                 pass  # 老库无 amendment_vectors——修订向量路静默跳过
 

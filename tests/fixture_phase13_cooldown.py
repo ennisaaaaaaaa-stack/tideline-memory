@@ -12,7 +12,7 @@
 
 跑法:  /home/ubuntu/.hermes/hermes-agent/venv/bin/python tests/fixture_phase13_cooldown.py
 """
-import asyncio, importlib.util, os, sqlite3, sys, tempfile
+import asyncio, importlib.util, json, os, sqlite3, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -40,6 +40,7 @@ def make_embed(behavior):
         return None
     return fake_embed
 
+REAL_EMBED = srv._embed  # 原版真身——13d 验 httpx/缓存层（mock 抓不到的那层）
 PROBE = srv._AMVEC_PROBE_TEXT
 results = []
 
@@ -161,6 +162,69 @@ async def main():
           c.execute("SELECT COUNT(*) n FROM amendment_vectors").fetchone()["n"] == 6)
     check("13c-4 force 补齐后清窗",
           c.execute("SELECT COUNT(*) n FROM amvec_cooldown").fetchone()["n"] == 0)
+
+    # ── 13d 会审复审三钉（鸣鸣 23:44 报账：P1 timeout真身/P2 哨兵绕L1/P3 model_ns）──
+    print("── 13d P1 timeout真身 / P2 哨兵绕L1 / P3 model_ns过滤 ──")
+    import httpx as _hx_mod, hashlib as _hl_mod
+    srv._embed = REAL_EMBED  # 换回真身——13a-5 只断了参数传进 mock，断不到 httpx 层
+
+    # P1: timeout 参数真穿透 httpx.AsyncClient（写死 60 = 摆设参数，鸣鸣①）
+    _captured = {}
+    class _ProbeCli:
+        def __init__(self, **kw):
+            _captured.update(kw)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, *a, **kw): raise RuntimeError("no-net")
+    _orig_cli = _hx_mod.AsyncClient
+    _hx_mod.AsyncClient = _ProbeCli
+    try:
+        await srv._amvec_embed("p1-wall-probe", cache=False)
+    finally:
+        _hx_mod.AsyncClient = _orig_cli
+    check("13d-1 timeout 真穿透 httpx（10.0，非写死 60）",
+          _captured.get("timeout") == 10.0, f"captured={_captured}")
+
+    # P2: 哨兵预置进缓存 + 死端口——cache=True 吃 L1 假活、cache=False 绕开真探
+    DB2 = tempfile.mktemp(suffix=".db")
+    srv.DB_PATH = DB2  # DB_PATH 模块加载时已定格——改 env 不生效，直接指新库
+    srv._init()
+    c2 = sqlite3.connect(DB2); c2.row_factory = sqlite3.Row
+    _tkey = _hl_mod.sha256(PROBE.encode("utf-8")).hexdigest()
+    _mns = srv._EMB_MODEL + "|local"
+    c2.execute(
+        "INSERT INTO embedding_cache(text_hash, model_ns, vector, created_at)"
+        " VALUES(?,?,?,?)", (_tkey, _mns, json.dumps([9.9, 9.9, 9.9]), "2026-09-08 00:00:00"))
+    c2.commit()
+    srv._EMB_URL = "http://127.0.0.1:9/embed_batch"  # 死端口=连接类拒绝（非挂起）
+    _vec_cached = await REAL_EMBED(PROBE)                    # 默认 cache=True → L1 命中
+    _vec_probe = await srv._amvec_embed(PROBE, cache=False)  # 绕 L1 → 网络死 → None
+    check("13d-2 哨兵已缓存：cache=True 零网络命中（缓存层在岗）",
+          _vec_cached == [9.9, 9.9, 9.9])
+    check("13d-3 哨兵已缓存：cache=False 绕 L1 真探（死端口→None，全局窗有得开）",
+          _vec_probe is None)
+    check("13d-4 探针不落缓存（embedding_cache 行数不变）",
+          c2.execute("SELECT COUNT(*) n FROM embedding_cache").fetchone()["n"] == 1)
+
+    # P3: 修订向量扫描按 model_ns 过滤（换模型后旧空间向量不参与 cosine）
+    # schema 真相：PK=amendment_id 单列——一条修订只有一行，换模型时 REPLACE
+    # 顶掉旧的。混空间只发生在「不同修订」间（换模型后补铸完之前的窗口）。
+    nid3, aids3 = seed(c2, 2)
+    c2.execute(
+        "INSERT INTO amendment_vectors(amendment_id, narrative_id, text_hash,"
+        " model_ns, vector, created_at) VALUES(?,?,?,?,?,?)",
+        (aids3[0], nid3, "hash-new", _mns, json.dumps([0.1, 0.2, 0.3]),
+         "2026-09-08 00:01:00"))
+    c2.execute(
+        "INSERT INTO amendment_vectors(amendment_id, narrative_id, text_hash,"
+        " model_ns, vector, created_at) VALUES(?,?,?,?,?,?)",
+        (aids3[1], nid3, "hash-old", "old-model|local",
+         json.dumps([0.9, 0.8, 0.7]), "2026-09-08 00:01:00"))
+    c2.commit()
+    _scan = srv._amvec_scan(c2)
+    check("13d-5 扫描只回当前 model_ns 向量（旧空间不参与 cosine）",
+          len(_scan) == 1 and _scan[0]["amendment_id"] == aids3[0],
+          f"got={[r['amendment_id'] for r in _scan]}")
 
     # ── 汇总 ─────────────────────────────────────────────────
     ok = sum(1 for _, o in results if o)
