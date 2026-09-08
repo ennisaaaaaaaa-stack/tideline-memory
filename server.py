@@ -951,13 +951,16 @@ def _amendments_for(nid, c):
     except sqlite3.OperationalError:
         return []  # 旧库还没跑过 v2.6 迁移——显示不挡路
 
-def _effective_text(nid, c):
+def _effective_text(nid, c, tail_only=False):
     """v2.7: 机读生效态（会审 #395/#397/#404）——本体 + 修订按时序叠成。
 
     两层分工：_fmt_narrative 是显示层（原文+📝痕迹，看得见层次）；
     这是语义层（这条记忆「现在到底说什么」）。DREAM 批量扫、外部机读
     消费方、未来单条详情读取，都从这取。得分定排序、时序定回显——
     回显的内容由时序叠层决定，跟哪条检索路径分高无关。
+    v2.8收尾车：真接线（#400/#486拍板，2026-09-09）——三家消费方切换：
+    search回显/recall回显的修订段、traj_promote list的生效态附文，
+    都从这取修订尾（tail_only），修订叠层逻辑只此一处（#397单一来源）。
     """
     row = c.execute(
         "SELECT content, gesture, context_layer FROM narratives WHERE id = ?", (nid,)
@@ -967,6 +970,8 @@ def _effective_text(nid, c):
     base = row["gesture"] or row["content"] or ""
     if row["context_layer"]:
         base = f"{base} | {row['context_layer']}"
+    if tail_only:
+        return "\n".join(a["amendment"] for a in _amendments_for(nid, c))
     return "\n".join([base] + [a["amendment"] for a in _amendments_for(nid, c)])
 
 def _dedup_rows_by_id(rows):
@@ -987,9 +992,17 @@ def _fmt_narrative(r, c=None):
     三个调用方（recall/search×2）都有 c 在手，全部传进来。
     v2.7: 叠层数据改走 _amendments_for 单一来源。"""
     def _amend_lines(nid):
+        # v2.8收尾车：修订行改走 _effective_text(tail_only)——机读生效态
+        # 单一出口（#400真接线）。显示层保留📝标记和原因（人读层次），
+        # 正文不截断：修订是稀有事件，200字截断是给注入侧的预算，
+        # 不该由机读出口背（拍板：按分布再调，不预设）。
+        # 依赖方向：显示层吃语义层的输出——未来生效态逻辑变（过滤/重排/
+        # 新cast），显示自动跟上，修订叠层语义只此一处（#397/#400）。
+        eff_tail = _effective_text(nid, c, tail_only=True)
+        bodies = eff_tail.split("\n") if eff_tail else []
         lines = []
-        for ar in _amendments_for(nid, c):
-            body = ar["amendment"] if len(ar["amendment"]) <= 200 else ar["amendment"][:200] + "…"
+        for i, ar in enumerate(_amendments_for(nid, c)):
+            body = bodies[i] if i < len(bodies) else ar["amendment"]
             why = f" ｜原因: {ar['reason']}" if ar["reason"] else ""
             lines.append(f"   📝 修订{ar['created_at'][:10]}: {body}{why}")
         # v2.8: 轨迹链（MCP查询侧=翻笔记，绝对时间保层次）。
@@ -1633,9 +1646,13 @@ async def _dispatch(name, a, c):
                     text="🧭 没有待升格的轨迹（全部已是llm或还没有轨迹）。")]
             lines = ["🧭 待升格轨迹（cast='mech'）：\n"]
             for r in rows:
-                # 附上机械轨迹内容供DREAM直接读——省一次查询
+                # 附上机械轨迹内容供DREAM直接读——省一次查询。
+                # v2.8收尾车：附生效态全文（#400第三消费方接线）——升格前
+                # 读「这条记忆现在到底说什么」（本体+全部修订），DREAM
+                # 重讲故事的底稿从机读出口取，不借人读格式的📝前缀。
                 rendered = _trajectory_render(c, r["narrative_id"], relative=False)
-                lines.append(f"#{r['narrative_id']}（{r['n_events']}段）: {rendered}")
+                eff = _effective_text(r["narrative_id"], c)
+                lines.append(f"#{r['narrative_id']}（{r['n_events']}段）: {rendered}\n   生效态: {eff}")
             return [types.TextContent(type="text", text="\n\n".join(lines))]
         if action == "write":
             nid = a.get("narrative_id")

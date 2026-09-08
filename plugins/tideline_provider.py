@@ -27,6 +27,17 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
+# R63 2026-08-30: written into attention_log.code_version so future
+# archaeology tells WHICH code produced WHICH rows without pyc forensics.
+# v1  = 8/9   no dedup
+# v1.5= 8/11  _injected_ids dedup, inject+log top-5
+# v2  = 8/22  top-3 + rollover + full-guard (compiled 8/22 22:02, never loaded)
+# v2.2= 9/9   r64: trajectory render (v2.8) — narratives with appends render
+#             as 🧭 trajectory chains (relative time, anchors stripped),
+#             not full amendment stacks. 甜心spec: 注入轻、轨迹住母块内。
+TIDELINE_CODE_VERSION = "v2.2-r64"
+
+
 import os as _os
 
 import re as _re
@@ -70,6 +81,78 @@ def _clip(text: str, n: int) -> str:
     if len(text) <= n:
         return text
     return text[:n].rstrip() + "…"
+
+
+# ─── v2.8 trajectory render (injection side, 2026-09-09) ───
+# 甜心spec: 命中带append的narrative → 呈现轨迹链而非append全文。
+# 注入=回忆原则: 相对时间、拆mech态锚脚手架、轨迹住母记忆块内。
+# DB是共享库（MCP先写trajectories表，provider只读）——表不存在时静默跳过
+# （生产库在v2.8部署车前的过渡期），无append的narrative零开销。
+
+TRAJ_EVENT_CAP_INJ = 6   # 注入侧轨迹链上限——比MCP查询侧(12)更紧：注入要轻
+
+def _traj_render_inj(c, nid) -> str:
+    """v2.8: render trajectory chain for injection. Returns '' if none."""
+    import json as _json
+    try:
+        row = c.execute(
+            "SELECT traj_json, n_events FROM trajectories WHERE narrative_id=?",
+            (nid,)).fetchone()
+    except sqlite3.OperationalError:
+        return ""   # 表不存在（老库）——静默跳过，不挡注入
+    if not row:
+        return ""
+    try:
+        events = _json.loads(row["traj_json"]) if row["traj_json"] else []
+    except (ValueError, TypeError):
+        return ""
+    if not events:
+        return ""
+    total = row["n_events"] or len(events)
+    # 注入侧更紧的帽：保最新6段（存储侧存12段是给查询侧的预算）
+    events = events[-TRAJ_EVENT_CAP_INJ:]
+    dropped = max(0, total - len(events))
+    # 相对时间：注入=回忆，今天/昨天/N天前——绝对时间留给MCP查询侧（翻笔记）
+    from datetime import datetime as _dt
+    try:
+        now = _dt.utcnow()
+    except AttributeError:
+        from datetime import timezone as _tz
+        now = _dt.now(_tz.utc).replace(tzinfo=None)
+    parts = []
+    for ev in events:
+        text = _strip_anchor_scaffold(ev.get("text", ""))
+        if not text:
+            continue
+        ts = ev.get("ts", "")
+        when = _relative_days(ts, now)
+        parts.append(f"{when}，{text}")
+    if not parts:
+        return ""
+    out = " → ".join(parts)
+    if dropped:
+        out += f"（更早{dropped}段略）"
+    return out
+
+def _strip_anchor_scaffold(text: str) -> str:
+    """v2.8: 拆mech态轨迹段的「（锚：…）」脚手架——锚是给检索的，不是给注入读的。"""
+    if not text:
+        return text
+    return _re.sub(r'（锚：[^）]*）', '', text).strip()
+
+def _relative_days(ts: str, now) -> str:
+    """v2.8: 'YYYY-MM-DD HH:MM:SS'(UTC naive) → 今天/昨天/N天前。解析失败回ts[:10]。"""
+    from datetime import datetime as _dt
+    try:
+        then = _dt.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        days = (now - then).days
+        if days <= 0:
+            return "今天"
+        if days == 1:
+            return "昨天"
+        return f"{days}天前"
+    except (ValueError, TypeError):
+        return (ts or "")[:10]
 
 
 def _cosine(a: list, b: list) -> float:
@@ -415,9 +498,10 @@ class TidelineMemoryProvider(MemoryProvider):
                 if t4_results:
                     lines = ["## 相关记忆（auto-recalled）\n"]
                     for sim, r in top:
-                        cd = f" → {_strip_tags(r['cognition_direction'])}" if r["cognition_direction"] else ""
-                        ctx = f" ({_strip_tags(r['context_layer'])})" if r["context_layer"] else ""
-                        lines.append(f"- {_strip_tags(r['gesture'])}{cd}{ctx} [sim={sim:.2f}]")
+                        cd = f" → {_clip(_strip_tags(r['cognition_direction']), 80)}" if r["cognition_direction"] else ""
+                        traj = _traj_render_inj(c, r["id"])   # v2.8: 轨迹链
+                        traj_s = f"\n  🧭 {traj}" if traj else ""
+                        lines.append(f"- {_clip(_strip_tags(r['gesture']), 120)}{cd}{traj_s} [sim={sim:.2f}]")
                     lines.append("\n## 远期记忆（FTS5 fallback）\n")
                     lines.append(t4_results)
                     c.close()
@@ -435,7 +519,11 @@ class TidelineMemoryProvider(MemoryProvider):
             lines = ["## 相关记忆（auto-recalled）\n"]
             for sim, r in top:
                 cd = f" → {_clip(_strip_tags(r['cognition_direction']), 80)}" if r["cognition_direction"] else ""
-                lines.append(f"- {_clip(_strip_tags(r['gesture']), 120)}{cd} [sim={sim:.2f}]")
+                # v2.8: 命中带append的narrative → 🧭轨迹链（相对时间，拆锚脚手架），
+                # 住母记忆块内。无轨迹条目零开销（一行都不加）。
+                traj = _traj_render_inj(c, r["id"])
+                traj_s = f"\n  🧭 {traj}" if traj else ""
+                lines.append(f"- {_clip(_strip_tags(r['gesture']), 120)}{cd}{traj_s} [sim={sim:.2f}]")
 
             # Non-silent degradation notice
             if scan_truncated:
@@ -472,6 +560,12 @@ class TidelineMemoryProvider(MemoryProvider):
                     created_at TEXT NOT NULL
                 )
             """)
+            # code_version column: survive silent version-skew (R63 2026-08-30).
+            # Old rows have NULL; new rows record which code produced them.
+            try:
+                c.execute("ALTER TABLE attention_log ADD COLUMN code_version TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             c.execute("""
                 CREATE TABLE IF NOT EXISTS attention_stats (
                     cluster_name TEXT PRIMARY KEY,
@@ -510,8 +604,8 @@ class TidelineMemoryProvider(MemoryProvider):
                     names.append(f"emb:#{','.join(str(c) for c in emb_map[nid])}")
                 cname = " | ".join(names) if names else "_unclassified"
                 c.execute(
-                    "INSERT INTO attention_log (narrative_id, sim, cluster_name, created_at) VALUES (?,?,?,?)",
-                    (nid, float(sim), cname, now)
+                    "INSERT INTO attention_log (narrative_id, sim, cluster_name, created_at, code_version) VALUES (?,?,?,?,?)",
+                    (nid, float(sim), cname, now, TIDELINE_CODE_VERSION)
                 )
                 c.execute("""
                     INSERT INTO attention_stats (cluster_name, hit_count, last_hit, last_narrative_id)
