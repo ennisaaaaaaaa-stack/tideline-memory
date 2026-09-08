@@ -75,8 +75,8 @@ async def main():
     # ── 15b search回显断言（monkeypatch真身） ──────────────────
     print("── 15b search回显断言 ──")
     orig_eff = srv._effective_text
-    def _probe_eff(n, cur, tail_only=False):
-        return SENTINEL if not tail_only else SENTINEL
+    def _probe_eff(n, cur, tail_only=False, as_list=False):  # v2.8.1: 按as_list契约返回
+        return [SENTINEL] if as_list else SENTINEL
     srv._effective_text = _probe_eff
     try:
         fmt = srv._fmt_narrative(c.execute(
@@ -127,6 +127,30 @@ async def main():
           len(call_sites) >= 2, detail=f"调用点={len(call_sites)}")
     for ln in call_sites:
         print(f"      · {ln[:80]}")
+
+    # ── 15f 多行修订对位（#513 P1回归钉） ──────────────────────
+    print("── 15f 多行修订对位 ──")
+    nid_ml = c.execute(
+        "INSERT INTO narratives(ntype,gesture,content,tags,created_at)"
+        " VALUES('memory','多行修订对位锚点','全文本体','[]','2026-09-01 12:00:00')"
+    ).lastrowid
+    c.execute("INSERT INTO amendments(narrative_id,amendment,reason,created_at) VALUES(?,?,?,?)",
+              (nid_ml, "ML-A-line1\nML-A-line2", "多行对位", "2026-09-04 12:00:00"))
+    c.execute("INSERT INTO amendments(narrative_id,amendment,reason,created_at) VALUES(?,?,?,?)",
+              (nid_ml, "ML-B-tail", "多行对位", "2026-09-05 12:00:00"))
+    c.commit()
+    parts = srv._effective_text(nid_ml, c, tail_only=True, as_list=True)
+    check("15f-1 as_list逐条对位（不经join→split往返）",
+          parts == ["ML-A-line1\nML-A-line2", "ML-B-tail"],
+          detail=repr(parts))
+    fmt_ml = srv._fmt_narrative(c.execute(
+        "SELECT * FROM narratives WHERE id=?", (nid_ml,)).fetchone(), c)
+    ln_b = [ln for ln in fmt_ml.split("\n") if "修订2026-09-05" in ln]
+    check("15f-2 修订2归因正确（自己的正文，非修订1尾巴）",
+          bool(ln_b) and "ML-B-tail" in ln_b[0] and "ML-A-line2" not in ln_b[0],
+          detail=ln_b[0] if ln_b else "修订2行未找到")
+    check("15f-3 多行修订全文保留（两行都在显示里）",
+          "ML-A-line1" in fmt_ml and "ML-A-line2" in fmt_ml)
 
     c.close()
 
