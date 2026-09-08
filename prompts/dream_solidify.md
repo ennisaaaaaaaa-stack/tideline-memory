@@ -13,8 +13,10 @@
 执行脚本获取未索引对话块：
 
 ```bash
-/usr/bin/python3.12 /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/scan_unindexed.py
+/usr/bin/python3.12 /root/tideline-memory/scripts/scan_unindexed.py
 ```
+
+**路径注**：脚本已随迁移搬到 `/root/tideline-memory/scripts/`（旧 Portalk 路径已不存在）。聚类脚本同理用 `cd /root/tideline-memory && ./venv/bin/python scripts/...`（系统 python 缺 jieba/numpy）。
 
 ## 两条 Track
 
@@ -81,10 +83,10 @@ source_links: [56153, 56154, 56155]
 
 ```bash
 # jieba noun-frequency 聚类（DREAM层模式发现）
-/usr/bin/python3.12 /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/dream_scripts.py clusters
+cd /root/tideline-memory && ./venv/bin/python scripts/dream_scripts.py clusters
 
 # embedding-space soft clustering（检索路由 + 注意力追踪）
-/usr/bin/python3.12 /home/ubuntu/Portalk/mcp-servers/memory-mcp/scripts/soft_clusters.py build
+cd /root/tideline-memory && ./venv/bin/python scripts/soft_clusters.py build
 ```
 
 两条都要跑。第一条管 DREAM 梳理层的主题图谱注入，第二条管检索路由和注意力分布。
