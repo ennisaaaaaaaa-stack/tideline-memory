@@ -13,7 +13,7 @@ Environment variables:
   AGENT_NAME          Agent label for logs (default: "agent")
 """
 
-import os, sys, json, math, sqlite3
+import os, sys, json, math, sqlite3, hashlib, re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +27,35 @@ AGENT     = os.environ.get("AGENT_NAME", "agent")
 
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+# ─── v2.5 anti-blanking guards & overwrite history (2026-09-03) ──────────
+# 起因：9/2 事故——schema 接受空字符串为合法 content，一次误写清空了
+# profiles/self_concept 全部字段，session 上下文成了唯一恢复源。
+# 两层修复：①空 content 在门口拒绝（守卫层）②覆盖前旧值归档进
+# <table>_history（回滚层）。线上表仍只存最新版——它每 session 注入，
+# 历史归档只按需查询。
+
+def _reject_empty(content, what):
+    """拒绝会把现有内容清空的空写入。空 content 是 schema 合法值，
+    但对覆盖型写入（profiles/self_concept/threads 更新）等于毁数据。"""
+    if content is None or not str(content).strip():
+        raise ValueError(f"{what}: 拒绝空 content——这会清空现有内容（9/2 事故后加的守卫）")
+    return str(content)
+
+def _archive_if_overwritten(c, table, key_cols, key_vals):
+    """UPSERT 覆盖前，把旧行整份存进 {table}_history。
+    表名/列名是调用点硬编码字面量，不是用户输入——无注入面。"""
+    try:
+        where = " AND ".join(f"{k}=?" for k in key_cols)
+        row = c.execute(f"SELECT content FROM {table} WHERE {where}", key_vals).fetchone()
+        if row and str(row["content"] or "").strip():
+            c.execute(
+                f"INSERT INTO {table}_history({', '.join(key_cols)}, old_content, archived_at)"
+                " VALUES(" + ",".join(["?"] * (len(key_cols) + 2)) + ")",
+                (*key_vals, row["content"], _now()),
+            )
+    except sqlite3.OperationalError:
+        pass  # 历史表还没迁移——绝不能因为归档失败挡住线上写入
 
 # ─── Database ────────────────────────────────────────────
 def _db():
@@ -107,6 +136,132 @@ def _init():
         content TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(field)
+    );
+
+    -- ═══════ v2.5 NEW: overwrite history (回滚层, 2026-09-03) ═══════
+    -- 覆盖型写入（profiles / self_concept）在 UPSERT 前把旧值整份归档。
+    -- 线上表只存最新版（每 session 注入用），历史在这里按需回查/回滚。
+    -- 触发器限容：每个键最多保留最近 30 版，防无限膨胀。
+    CREATE TABLE IF NOT EXISTS profiles_history(
+        hid INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity TEXT NOT NULL,
+        ptype TEXT NOT NULL,
+        old_content TEXT NOT NULL,
+        archived_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_profiles_history
+        ON profiles_history(entity, ptype, hid DESC);
+    CREATE TRIGGER IF NOT EXISTS trg_profiles_history_cap
+    AFTER INSERT ON profiles_history
+    BEGIN
+        DELETE FROM profiles_history
+        WHERE entity = NEW.entity AND ptype = NEW.ptype
+          AND hid NOT IN (SELECT hid FROM profiles_history
+                          WHERE entity = NEW.entity AND ptype = NEW.ptype
+                          ORDER BY hid DESC LIMIT 30);
+    END;
+    CREATE TABLE IF NOT EXISTS self_concept_history(
+        hid INTEGER PRIMARY KEY AUTOINCREMENT,
+        field TEXT NOT NULL,
+        old_content TEXT NOT NULL,
+        archived_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_self_concept_history
+        ON self_concept_history(field, hid DESC);
+    CREATE TRIGGER IF NOT EXISTS trg_self_concept_history_cap
+    AFTER INSERT ON self_concept_history
+    BEGIN
+        DELETE FROM self_concept_history
+        WHERE field = NEW.field
+          AND hid NOT IN (SELECT hid FROM self_concept_history
+                          WHERE field = NEW.field
+                          ORDER BY hid DESC LIMIT 30);
+    END;
+
+    -- ═══════ v2.6 NEW: amendments (修订层, 2026-09-06) ═══════
+    -- 条目不可变：narratives 永不 UPDATE 语义字段。
+    -- 修订 = 独立append-only表，按 narrative_id 关联，读取时叠层显示。
+    -- 过期理解不消失，新增的理解叠上去——看得见层次。
+    -- 同族先例：profiles_history(覆盖归档)/threads(探索线索)，本表是
+    -- 正向修订：不替换任何东西，只往上面加便签。
+    CREATE TABLE IF NOT EXISTS amendments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        narrative_id INTEGER NOT NULL,
+        amendment TEXT NOT NULL,
+        reason TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (narrative_id) REFERENCES narratives(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_amendments_nid ON amendments(narrative_id, created_at);
+
+    -- ═══════ v2.7 NEW: amendment_vectors (修订语义边表, 2026-09-07) ═══════
+    -- 会审三司拍板（#391/#393/#397/#402）：修订进检索是义务，不是设计取舍。
+    -- 本体向量长在 narratives 行上（embedding 列）——修订向量不进本体行，
+    -- 挂边表：旧行不动、伪条目不入 narratives（聚类/实体图/列表页零污染）。
+    -- 任一命中（本体向量 or 修订向量）都召回原条目，检索侧按 narrative_id
+    -- 收敛取 max（得分定排序、时序定回显——两根轴分家，#395）。
+    CREATE TABLE IF NOT EXISTS amendment_vectors(
+        amendment_id INTEGER PRIMARY KEY,
+        narrative_id INTEGER NOT NULL,
+        text_hash TEXT NOT NULL,
+        model_ns TEXT NOT NULL,
+        vector TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (amendment_id) REFERENCES amendments(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_amvec_nid ON amendment_vectors(narrative_id);
+
+    -- ═══════ v2.7.1 NEW: amvec_cooldown (补铸失败分层冷却, 2026-09-08) ═══════
+    -- 13c 拍板（无名分层+mingming认账+hui01:16交底）：错误分层，一刀解两头——
+    --   连接类失败（服务不可达/超时）→ scope='global' 全局歇：断网是服务级
+    --     状态，窗内一切补铸（查询路+批量路）直接跳过，第一条付一次失败
+    --     成本、窗口内其余全免（zhaozhao第13条①：查询路同步补铸的最坏 186s
+    --     不能每次命中都重烧）；
+    --   条目类失败（服务在但这条被拒）→ scope='amend:<id>' 一条一账：
+    --     一个坏条目不摁住全表（mingming 01:09 的连坐钉）。
+    -- 批量路（DREAM 夜扫 nids=None）同一张表说了算（无名 01:10a）。
+    -- 曾有两个先行版本（amendment_id 键 / day+model_ns 键）双重定义互相
+    -- 静默吞掉（hui01:25 读档钉）——本版是按拍板重落的唯一正身。
+    CREATE TABLE IF NOT EXISTS amvec_cooldown(
+        scope TEXT NOT NULL,
+        model_ns TEXT NOT NULL,
+        failed_at TEXT NOT NULL,
+        PRIMARY KEY(scope, model_ns)
+    );
+
+    -- ═══════ v2.8 NEW: trajectories (轨迹压缩, 2026-09-08) ═══════
+    -- 设计师spec：命中带append的narrative，注入呈现轨迹而非append全文。
+    -- 「n天前，一句话事件＋想法 → n天前，一句话事件＋想法 → …」循环链。
+    -- 每段带原始narrative关键词（检索锚，顺手捞回全文）。
+    -- 三层铸造（继承v2.7 lazy模式）：
+    --   机械垫底：memory_amend 同事务重算 cast='mech'——任何时刻注入有轨迹
+    --   LLM升格：DREAM固化层夜扫 cast='mech' → 自然语言事件链 cast='llm'
+    --             （「想法」层必须LLM，纯机械拼接出不来）
+    --   渲染层算「N天前」：存储保真绝对ts，注入时人性化相对时间
+    -- 新amend → 整条轨迹回 mech 重升格（故事重讲，不做段级混合cast）。
+    -- v2.6铁律：不碰narratives行——轨迹独立存储，PK=narrative_id 1:1。
+    CREATE TABLE IF NOT EXISTS trajectories(
+        narrative_id INTEGER PRIMARY KEY,
+        traj_json TEXT NOT NULL,          -- JSON [{ts, text}, ...] 按时序
+        n_events INTEGER NOT NULL DEFAULT 0,
+        latest_amendment_id INTEGER,      -- 指纹：轨迹覆盖到的最后一条amend
+        cast_state TEXT NOT NULL DEFAULT 'mech',  -- mech | llm（cast是SQL保留字）
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_traj_pending ON trajectories(cast_state);
+
+    -- ═══════ v2.6 NEW: embedding_cache (语义层缓存, 2026-09-06) ═══════
+    -- 图纸：graphify 双层缓存的语义层复刻——按 prompt 指纹作废。
+    -- 键 = sha256(text) + 模型命名空间；换 embedding 模型 = 新命名空间，
+    -- 旧向量永远不会被新模型读到（防旧 bug 阴魂，同 AST 层思路）。
+    -- 花钱买的不轻易作废：文本没变就吃缓存。
+    CREATE TABLE IF NOT EXISTS embedding_cache(
+        text_hash TEXT NOT NULL,
+        model_ns TEXT NOT NULL,
+        vector TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(text_hash, model_ns)
     );
 
     -- ═══════ v2.3 NEW: topic_clusters (for jieba noun-frequency clustering) ═══════
@@ -196,8 +351,374 @@ def _init():
         INSERT INTO narratives_fts(rowid, gesture, context_layer, cognition_direction, tags)
         VALUES (new.id, new.gesture, new.context_layer, new.cognition_direction, new.tags);
     END;
+
+    -- v2.7: 修订进检索（会审拍板 #391/#395/#397/#402/#404）——修订的
+    -- 关键词路有自己的 FTS 表：amendment 文本进索引、命中映射回原条目。
+    -- external-content 模式 + 触发器同步：amendments 表是普通表（好查询好
+    -- join），fts 只做倒排。rebuild 兜底老索引漂移（见 _ensure_amfts_sync）。
+    CREATE VIRTUAL TABLE IF NOT EXISTS amendments_fts
+        USING fts5(amendment, reason, content='amendments', content_rowid='id', tokenize='trigram');
+
+    CREATE TRIGGER IF NOT EXISTS am_fts_ai AFTER INSERT ON amendments BEGIN
+        INSERT INTO amendments_fts(rowid, amendment, reason)
+        VALUES (new.id, new.amendment, new.reason);
+    END;
+    CREATE TRIGGER IF NOT EXISTS am_fts_ad AFTER DELETE ON amendments BEGIN
+        INSERT INTO amendments_fts(amendments_fts, rowid, amendment, reason)
+        VALUES('delete', old.id, old.amendment, old.reason);
+    END;
+    CREATE TRIGGER IF NOT EXISTS am_fts_au AFTER UPDATE ON amendments BEGIN
+        INSERT INTO amendments_fts(amendments_fts, rowid, amendment, reason)
+        VALUES('delete', old.id, old.amendment, old.reason);
+        INSERT INTO amendments_fts(rowid, amendment, reason)
+        VALUES (new.id, new.amendment, new.reason);
+    END;
     """)
     c.commit(); c.close()
+
+# ─── v2.8 Trajectory (轨迹压缩) ───────────────────────────
+# 设计师spec：注入命中带append的narrative → 呈现轨迹链而非append全文。
+# 三层：机械垫底（写入同事务）→ LLM升格（DREAM夜扫）→ 渲染相对时间（注入时）。
+
+TRAJ_MECH_CLIP = 80   # 机械段文本截断——垫底层是保真不是终态
+TRAJ_EVENT_CAP = 12   # 轨迹链事件数上限——注入轻量化（设计师：注入别抢context window）
+
+def _extract_traj_anchor(gesture, tags_json):
+    """v2.8: 从原narrative提取检索锚关键词（每段叙述都带，顺手捞回全文）。
+
+    锚 = gesture的头几个实词 + tags里的实词tag。机械提取，不完美但可捞：
+    轨迹段被读到时，锚词是 memory_search 的天然query。
+    """
+    words = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', gesture or "")
+    anchor_words = words[:3]
+    try:
+        tags = json.loads(tags_json) if tags_json else []
+    except (json.JSONDecodeError, TypeError):
+        tags = []
+    for t in tags[:4]:
+        t = str(t)
+        if len(t) >= 2 and t not in anchor_words:
+            anchor_words.append(t)
+    return "、".join(anchor_words[:5])
+
+def _rebuild_traj_mech(c, nid):
+    """v2.8 机械垫底层：narrative本体+全部amendments → 轨迹JSON。
+
+    每段 = {ts, text}。本体段ts=created_at，amend段ts=amend.created_at。
+    段文本：本体段=gesture截断+锚；amend段=amendment截断+锚。
+    纯机械零LLM零网络——memory_amend同事务调用，任何时刻注入有轨迹可读。
+    已有llm升格的轨迹被新amend作废：整条回mech（故事重讲语义，#决策④）。
+    幂等：按narrative_id全量重算覆盖。
+    """
+    row = c.execute(
+        "SELECT id, gesture, content, tags, created_at FROM narratives WHERE id = ?",
+        (nid,)).fetchone()
+    if not row:
+        return None
+    anchor = _extract_traj_anchor(row["gesture"] or row["content"] or "", row["tags"])
+    events = []
+    g = (row["gesture"] or row["content"] or "").strip()
+    if g:
+        events.append({"ts": row["created_at"],
+                       "text": (g[:TRAJ_MECH_CLIP] + ("…" if len(g) > TRAJ_MECH_CLIP else ""))
+                               + (f"（锚：{anchor}）" if anchor else "")})
+    for ar in _amendments_for(nid, c):
+        t = (ar["amendment"] or "").strip()
+        if not t:
+            continue
+        events.append({"ts": ar["created_at"],
+                       "text": (t[:TRAJ_MECH_CLIP] + ("…" if len(t) > TRAJ_MECH_CLIP else ""))
+                               + (f"（锚：{anchor}）" if anchor else "")})
+    # 截断方向=保最新（与渲染层一致）；n_events记原始总数，渲染层算「更早N段略」
+    n_total = len(events)
+    events = events[-TRAJ_EVENT_CAP:]
+    latest_aid = c.execute(
+        "SELECT MAX(id) AS m FROM amendments WHERE narrative_id = ?", (nid,)).fetchone()["m"]
+    now = _now()
+    traj = json.dumps(events, ensure_ascii=False)
+    c.execute(
+        """INSERT INTO trajectories(narrative_id, traj_json, n_events,
+               latest_amendment_id, cast_state, created_at, updated_at)
+           VALUES(?,?,?,?, 'mech', ?, ?)
+           ON CONFLICT(narrative_id) DO UPDATE SET
+               traj_json=excluded.traj_json, n_events=excluded.n_events,
+               latest_amendment_id=excluded.latest_amendment_id,
+               cast_state='mech', updated_at=excluded.updated_at""",
+        (nid, traj, n_total, latest_aid, now, now))
+    return n_total
+
+def _traj_pending(c, limit=50):
+    """v2.8: DREAM升格候选——cast='mech' 的轨迹（LLM夜扫入口）。"""
+    try:
+        return c.execute(
+            "SELECT narrative_id, n_events FROM trajectories"
+            " WHERE cast_state='mech' ORDER BY updated_at DESC LIMIT ?",
+            (limit,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+def _save_traj_llm(c, nid, events):
+    """v2.8 LLM升格层落盘：DREAM产出的自然语言事件链写回。
+
+    events = [{ts, text}, ...]（text已是「一句话事件＋想法」自然语言）。
+    校验失败（空/畸形）不落盘——mech垫底还在，注入不受影响。
+    """
+    if not events:
+        return False
+    clean = []
+    for ev in events:
+        t = str(ev.get("text", "")).strip()
+        ts = str(ev.get("ts", "")).strip()
+        if t and ts:
+            clean.append({"ts": ts, "text": t})
+    if not clean:
+        return False
+    latest_aid = c.execute(
+        "SELECT MAX(id) AS m FROM amendments WHERE narrative_id = ?", (nid,)).fetchone()["m"]
+    # 保最新cap段；n_events记原始总数（渲染层算「更早N段略」）
+    n_total = len(clean)
+    stored = clean[-TRAJ_EVENT_CAP:]
+    c.execute(
+        """UPDATE trajectories SET traj_json=?, n_events=?, latest_amendment_id=?,
+               cast_state='llm', updated_at=? WHERE narrative_id=?""",
+        (json.dumps(stored, ensure_ascii=False), n_total,
+         latest_aid, _now(), nid))
+    return True
+
+def _trajectory_render(c, nid, max_events=None, relative=True):
+    """v2.8 渲染层：轨迹JSON → 「n天前，事件 → n天前，事件」自然语言链。
+
+    注入=回忆（纯自然语言）原则：相对时间（今天/昨天/N天前），零技术元数据。
+    供 provider 注入与 MCP 查询侧共用；MCP 侧传 relative=False 保绝对时间。
+    截断策略：链过长时保留最新 max_events 段（老事件被压缩进轨迹本身就是
+    轨迹压缩的意义），尾部注「更早N段略」——不静默截断。
+    """
+    try:
+        row = c.execute(
+            "SELECT traj_json, n_events FROM trajectories WHERE narrative_id=?",
+            (nid,)).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    if not row:
+        return ""
+    try:
+        events = json.loads(row["traj_json"])
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not events:
+        return ""
+    total = row["n_events"] or len(events)
+    cap = max_events or TRAJ_EVENT_CAP
+    # n_events=历史总事件数；traj_json=最新cap段。dropped=被压缩掉的早期事件数
+    dropped = max(0, total - len(events))
+    now_ts = int(c.execute("SELECT strftime('%s','now')").fetchone()[0])
+    parts = []
+    for ev in events:
+        ts = ev.get("ts", "")
+        text = ev.get("text", "")
+        if not text:
+            continue
+        when = ts
+        if relative and ts:
+            try:
+                ev_ts = int(c.execute("SELECT strftime('%s', ?)", (ts,)).fetchone()[0])
+                days = max(0, (now_ts - ev_ts) // 86400)
+                when = "今天" if days == 0 else ("昨天" if days == 1 else f"{days}天前")
+            except (TypeError, ValueError, sqlite3.DatabaseError):
+                when = ts[:10]
+        parts.append(f"{when}，{text}")
+    if not parts:
+        return ""
+    out = " → ".join(parts)
+    if dropped:
+        out += f"（更早{dropped}段略）"
+    return out
+
+def _ensure_amfts_sync(c):
+    """v2.7: amendments_fts 一致性对账（漂移即 rebuild）。
+
+    为什么不是触发器就够：外部写入（迁移脚本/手工 sqlite3）绕过触发器后，
+    external-content FTS 会静默漂移——查询不报错，只是少行。
+    为什么不是行数对账：external-content 模式下 COUNT(*) 穿透读内容表，
+    索引缺行时计数照样相等（真跑抓出来的，探针本身是空转）。
+    正典探针 = FTS5 integrity-check（rank=1 比对索引与内容表）：
+    不一致抛 DatabaseError → rebuild 一次。amendments 是稀有事件表，
+    全表扫的代价可忽略；rebuild 期间查询走 LIKE 兜底不受影响。
+    """
+    try:
+        c.execute("INSERT INTO amendments_fts(amendments_fts, rank) VALUES('integrity-check', 1)")
+        c.commit()
+    except sqlite3.DatabaseError:
+        try:
+            c.execute("INSERT INTO amendments_fts(amendments_fts) VALUES('rebuild')")
+            c.commit()
+        except Exception:
+            pass  # rebuild 也失败（表不存在等老库）——查询路有 LIKE 兜底，不挡路
+
+AMVEC_COOLDOWN_SECONDS = 900   # 第13条①：冷却窗 15 分钟
+AMVEC_BACKFILL_RETRIES = 1     # 13b：补铸是副业，不继承主业重试预算
+AMVEC_BACKFILL_TIMEOUT = 10.0  # 13b：1 次 × 10s 封顶（186s 是事故形状）
+_AMVEC_PROBE_TEXT = "amvec connectivity probe"  # 常量哨兵——探针 cache=False 绕 L1 真探（mingmingP2：进缓存=稳态活虫）
+
+def _amvec_cooling_down(c, mns, now_ts=None):
+    """v2.7.1: 全局冷却窗（连接类失败）是否生效。scope='global' 一行
+    代表「embedding 服务此刻不可达」，窗内一切补铸直接跳过。"""
+    try:
+        row = c.execute(
+            "SELECT failed_at FROM amvec_cooldown WHERE scope='global' AND model_ns=?",
+            (mns,)).fetchone()
+        if not row:
+            return False
+        fa = int(c.execute("SELECT strftime('%s', ?)",
+                           (row["failed_at"],)).fetchone()[0])
+        if now_ts is None:
+            now_ts = int(c.execute("SELECT strftime('%s', ?)",
+                                   (_now(),)).fetchone()[0])
+        return (now_ts - fa) < AMVEC_COOLDOWN_SECONDS
+    except sqlite3.OperationalError:
+        return False  # 老库无表——不挡补铸
+
+def _amvec_amend_cooling(c, mns, aid):
+    """v2.7.1: 条目级冷却（条目类失败）——一条一账，不株连全表。"""
+    try:
+        row = c.execute(
+            "SELECT failed_at FROM amvec_cooldown WHERE scope=? AND model_ns=?",
+            (f"amend:{aid}", mns)).fetchone()
+        if not row:
+            return False
+        fa = int(c.execute("SELECT strftime('%s', ?)",
+                           (row["failed_at"],)).fetchone()[0])
+        now_ts = int(c.execute("SELECT strftime('%s', ?)",
+                               (_now(),)).fetchone()[0])
+        return (now_ts - fa) < AMVEC_COOLDOWN_SECONDS
+    except sqlite3.OperationalError:
+        return False
+
+async def _amvec_embed(text, cache: bool = True):
+    """v2.7.1: 补铸专用 embed——1 次重试 × 10s 超时封顶。
+
+    副业不继承主业预算（无名 01:10b）：查询路上的补铸若继承 _embed 的
+    3×60s 重试，挂起型断网下一次命中最坏 186s 全挂在查询延迟上。
+    cache=False 供哨兵探针——绕 L1、不落缓存，每次都是真探。"""
+    return await _embed(text, _retries=AMVEC_BACKFILL_RETRIES,
+                        timeout=AMVEC_BACKFILL_TIMEOUT, cache=cache)
+
+def _amvec_record(c, scope, mns):
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO amvec_cooldown(scope, model_ns, failed_at)"
+            " VALUES(?,?,?)", (scope, mns, _now()))
+    except sqlite3.OperationalError:
+        pass  # 老库无表——记账失败不挡主路径
+
+def _amvec_scan(c, since=None, until=None):
+    """v2.7.2: 修订向量扫描路（search 3b）——按当前模型命名空间过滤。
+
+    WHERE v.model_ns=?（mingmingP3）：换 embedding 模型后旧空间向量参与
+    cosine 是噪声命中，model_ns 列设计出来就是等着过滤的。
+    JOIN amendments 是时间窗（since/until），不是过滤条件。"""
+    sql = "SELECT v.amendment_id, v.narrative_id, v.vector FROM amendment_vectors v"
+    params = []
+    if since:
+        sql += " JOIN amendments a ON a.id = v.amendment_id AND a.created_at >= ?"
+        params.append(since)
+    if until:
+        sql += " JOIN amendments a2 ON a2.id = v.amendment_id AND a2.created_at <= ?"
+        params.append(until)
+    sql += " WHERE v.model_ns = ?"
+    params.append(_EMB_MODEL + ("|local" if _is_local_emb() else "|api"))
+    return c.execute(sql, params).fetchall()
+
+def _amvec_cosine_hits(c, emb, since=None, until=None, threshold=0.3):
+    """v2.7.2: 扫描+cosine+映射回原条目。返回 [(score, row), ...]。"""
+    hits = []
+    for vr in _amvec_scan(c, since, until):
+        vscore = _cosine(emb, json.loads(vr["vector"]))
+        if vscore > threshold:
+            row = c.execute(
+                "SELECT * FROM narratives WHERE id = ?", (vr["narrative_id"],)
+            ).fetchone()
+            if row:
+                hits.append((vscore, row))
+    return hits
+
+async def _ensure_amvec_sync(c, nids=None, force=False):
+    """v2.7: 修订向量对账补铸（lazy 路的兜底）。
+
+    amendment 落地时铸向量失败（无网络/服务暂挂）不挡写入——这里补：
+    找出还没有当前模型命名空间向量的 amendment，逐条铸。
+    调用点：memory_amend 落地后（同条目补漏）、search 关键词命中后
+    （查询触发的 lazy——FTS/LIKE 当前置，没命中就不花这个钱，#383③）、
+    DREAM 夜扫 backfill（force=True：夜里批量补，翻得过冷却窗）。
+    铸不上（_embed 返回 None）静默跳过，下次再试。
+
+    v2.7.1 分层冷却（13c 拍板：连接类全局歇 + 条目类一条一账）：
+      失败鉴别用哨兵探针——条目铸失败时，用常量哨兵文本再探一次服务
+      （哨兵探针 cache=False 绕 L1 真探——进缓存反而成稳态活虫：断网后
+        L1 永远命中、探针永远「活着」，全局窗永远不再开【mingmingP2 复现坐实】）：
+        哨兵也死 → 连接类：记 scope='global' 全局窗并立刻收手，
+          窗内一切补铸（查询路+批量路）跳过——断网期第一条付一次
+          失败成本、窗口内其余全免（zhaozhao13①：186s 不能每次命中重烧）；
+        哨兵活着 → 条目类：只记 scope='amend:<id>'，一个坏条目
+          不摁住全表（mingming 01:09 连坐钉），别的照铸。
+      批量路（nids=None）进门先看同一张表（无名 01:10a）——全局窗
+      生效时夜扫前脚也歇；force=True 翻窗重试（夜里服务恢复了照补）。
+      有成功/没有漏铸可试 → 清窗（刚恢复的库立刻回到正常补铸）。
+    """
+    _mns = _EMB_MODEL + ("|local" if _is_local_emb() else "|api")
+    try:
+        if not force and _amvec_cooling_down(c, _mns):
+            return  # 全局冷却窗内——服务不可达，不烧预算，夜扫/恢复后再补
+        sql = ("SELECT a.id AS aid, a.narrative_id AS nid, a.amendment AS text"
+               " FROM amendments a")
+        params = []
+        if nids:
+            sql += f" WHERE a.narrative_id IN ({','.join('?' * len(nids))})"
+            params.extend(int(x) for x in nids)
+        tried = succeeded = 0
+        failed_aids = []
+        service_down = False
+        for row in c.execute(sql, params).fetchall():
+            if not force and _amvec_amend_cooling(c, _mns, row["aid"]):
+                continue  # 条目级窗内——这条修订上次被拒，跳过不重烧
+            has = c.execute(
+                "SELECT 1 FROM amendment_vectors WHERE amendment_id=? AND model_ns=?",
+                (row["aid"], _mns)).fetchone()
+            if has:
+                continue
+            tried += 1
+            vec = await _amvec_embed(row["text"])
+            if not vec:
+                probe = await _amvec_embed(_AMVEC_PROBE_TEXT, cache=False)
+                if not probe:
+                    # 哨兵也死 = 连接类：全局歇，立刻收手不再烧
+                    _amvec_record(c, "global", _mns)
+                    service_down = True
+                    break
+                failed_aids.append(row["aid"])  # 哨兵活 = 条目类：一条一账
+                continue
+            _tkey = hashlib.sha256(row["text"].encode("utf-8")).hexdigest()
+            c.execute(
+                "INSERT OR REPLACE INTO amendment_vectors"
+                "(amendment_id, narrative_id, text_hash, model_ns, vector, created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (row["aid"], row["nid"], _tkey, _mns, json.dumps(vec), _now()))
+            succeeded += 1
+        c.commit()
+        if service_down:
+            return
+        # 冷却账分层记（13c）：有成功或没有漏铸可试 = 服务在工作 → 清窗；
+        # 只有条目类失败 → 删全局窗（服务在线），失败条目逐条记账。
+        if tried > 0:
+            if succeeded == tried:
+                c.execute("DELETE FROM amvec_cooldown WHERE model_ns=?", (_mns,))
+            else:
+                c.execute("DELETE FROM amvec_cooldown WHERE model_ns=?", (_mns,))
+                for aid in failed_aids:
+                    _amvec_record(c, f"amend:{aid}", _mns)
+            c.commit()
+    except Exception:
+        pass  # 补铸失败不挡任何主路径——下次调用再试
 
 # ─── v2.3 Migration ──────────────────────────────────────
 def _migrate_narratives(c):
@@ -260,31 +781,90 @@ def _is_local_emb() -> bool:
     """True if embedding service is on localhost (no API key needed)."""
     return "localhost" in _EMB_URL or "127.0.0.1" in _EMB_URL
 
-async def _embed(text: str, _retries: int = 3):
+def _cache_embedding(text_hash: str, model_ns: str, vec) -> None:
+    """v2.6: 烧完 API 落缓存。失败静默——缓存层绝不挡主路径。
+    v2.7: 容量帽（会审挂账「embedding 无淘汰」）——超帽裁最旧，
+    bge-m3 1024 维一条 JSON 约 9KB，帽 20000 行 ≈ 180MB 上界，
+    活库实测 948 条 narratives、amendment 是稀有事件，够撑多年。"""
+    try:
+        cc = _db()
+        try:
+            cc.execute(
+                "INSERT OR REPLACE INTO embedding_cache(text_hash, model_ns, vector, created_at)"
+                " VALUES(?,?,?,?)",
+                (text_hash, model_ns, json.dumps(vec), _now()),
+            )
+            # v2.7 容量帽：只裁当前模型命名空间的最旧行——换模型不烧旧账
+            cc.execute(
+                """DELETE FROM embedding_cache WHERE model_ns = ?
+                   AND created_at <= (
+                       SELECT created_at FROM embedding_cache WHERE model_ns = ?
+                       ORDER BY created_at DESC LIMIT 1 OFFSET 20000)""",
+                (model_ns, model_ns),
+            )
+            cc.commit()
+        finally:
+            cc.close()
+    except Exception:
+        pass
+
+async def _embed(text: str, _retries: int = 3, timeout: float = 60.0,
+                cache: bool = True):
     """Return embedding vector via local bge-m3 or remote OpenAI-compatible API.
+
+    v2.6: 语义层缓存（graphify 双层缓存复刻）。键=text sha256+模型命名空间。
+    命中缓存直接返回（零网络）；未命中才烧 API，烧完落缓存。
+    缓存查询在无连接场景（测试/沙箱）静默跳过，不挡主路径。
+    v2.7.2: cache=False 供探针——绕 L1 也不落缓存（哨兵进缓存=稳态活虫）。
+    timeout 参数此前是摆设——httpx.AsyncClient 写死 60（zhaozhaoP1/mingming复审）。
 
     Includes retry logic — embedding server may be briefly unavailable.
     Logs to stderr on each failure so silent drops are visible.
     """
-    import httpx, asyncio as _aio
+    import httpx, asyncio as _aio, hashlib as _hl
+    text = text[:5000]
+    _tkey = _hl.sha256(text.encode("utf-8")).hexdigest()
+    _mns = _EMB_MODEL + ("|local" if _is_local_emb() else "|api")
+
+    # ── L1: 语义缓存命中 → 零网络返回（cache=False 探针绕过）──
+    if cache:
+        try:
+            cc = _db()
+            try:
+                row = cc.execute(
+                    "SELECT vector FROM embedding_cache WHERE text_hash=? AND model_ns=?",
+                    (_tkey, _mns)).fetchone()
+                if row:
+                    return json.loads(row["vector"])
+            finally:
+                cc.close()
+        except Exception:
+            pass  # 缓存层绝不能挡主路径——查询失败当 miss 处理
+
     last_err = None
     for attempt in range(_retries):
         try:
             headers = {}
             if _is_local_emb():
-                payload = {"texts": [text[:5000]]}
-                async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
+                payload = {"texts": [text]}
+                async with httpx.AsyncClient(trust_env=False, timeout=timeout) as cli:
                     r = await cli.post(_EMB_URL, json=payload)
                     r.raise_for_status()
-                    return r.json()["embeddings"][0]
+                    vec = r.json()["embeddings"][0]
+                    if cache:
+                        _cache_embedding(_tkey, _mns, vec)
+                    return vec
             else:
                 headers["Authorization"] = f"Bearer {_EMB_KEY}"
-                payload = {"model": _EMB_MODEL, "input": text[:5000]}
-                async with httpx.AsyncClient(trust_env=False, timeout=60) as cli:
+                payload = {"model": _EMB_MODEL, "input": text}
+                async with httpx.AsyncClient(trust_env=False, timeout=timeout) as cli:
                     r = await cli.post(_EMB_URL, json=payload, headers=headers)
                     r.raise_for_status()
                     data = r.json()
-                    return data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
+                    vec = data["data"][0]["embedding"] if "data" in data else data["embeddings"][0]
+                    if cache:
+                        _cache_embedding(_tkey, _mns, vec)
+                    return vec
         except Exception as e:
             last_err = e
             print(f"[memory-mcp] embed attempt {attempt+1}/{_retries} failed: {e}", file=sys.stderr)
@@ -355,8 +935,70 @@ def _log_attention_mcp(c, scored_results, source="mcp_search"):
         pass
 
 # ─── Formatting helpers ──────────────────────────────────
-def _fmt_narrative(r):
-    """v2.3: structured display — gesture is the headline, rest is detail."""
+def _amendments_for(nid, c):
+    """v2.7: 修订层的单一来源（#397「免得叠层逻辑散在多处」）。
+
+    显示层（_fmt_narrative 的 📝 行）和语义层（_effective_text）都从这取，
+    改叠层规则只改一处。同秒多条按 id 定序（mingming挂账：同秒时序加 id 排序）。
+    """
+    if c is None:
+        return []
+    try:
+        return c.execute(
+            "SELECT amendment, reason, created_at FROM amendments"
+            " WHERE narrative_id = ? ORDER BY created_at, id", (nid,)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # 旧库还没跑过 v2.6 迁移——显示不挡路
+
+def _effective_text(nid, c):
+    """v2.7: 机读生效态（会审 #395/#397/#404）——本体 + 修订按时序叠成。
+
+    两层分工：_fmt_narrative 是显示层（原文+📝痕迹，看得见层次）；
+    这是语义层（这条记忆「现在到底说什么」）。DREAM 批量扫、外部机读
+    消费方、未来单条详情读取，都从这取。得分定排序、时序定回显——
+    回显的内容由时序叠层决定，跟哪条检索路径分高无关。
+    """
+    row = c.execute(
+        "SELECT content, gesture, context_layer FROM narratives WHERE id = ?", (nid,)
+    ).fetchone()
+    if not row:
+        return ""
+    base = row["gesture"] or row["content"] or ""
+    if row["context_layer"]:
+        base = f"{base} | {row['context_layer']}"
+    return "\n".join([base] + [a["amendment"] for a in _amendments_for(nid, c)])
+
+def _dedup_rows_by_id(rows):
+    """v2.7: 按 narrative_id 收敛行（FTS 与 LIKE 双写后的第一道去重；
+    search 末端的分数收敛见 memory_search 主体）。保首见顺序。"""
+    seen = set()
+    out = []
+    for r in rows:
+        rid = r["id"]
+        if rid not in seen:
+            seen.add(rid)
+            out.append(r)
+    return out
+
+def _fmt_narrative(r, c=None):
+    """v2.3: structured display — gesture is the headline, rest is detail.
+    v2.6: 修订层——若传入 cursor，叠加显示该条目的 amendments（按时序）。
+    三个调用方（recall/search×2）都有 c 在手，全部传进来。
+    v2.7: 叠层数据改走 _amendments_for 单一来源。"""
+    def _amend_lines(nid):
+        lines = []
+        for ar in _amendments_for(nid, c):
+            body = ar["amendment"] if len(ar["amendment"]) <= 200 else ar["amendment"][:200] + "…"
+            why = f" ｜原因: {ar['reason']}" if ar["reason"] else ""
+            lines.append(f"   📝 修订{ar['created_at'][:10]}: {body}{why}")
+        # v2.8: 轨迹链（MCP查询侧=翻笔记，绝对时间保层次）。
+        # 只有轨迹存在才显示——无append的narrative零开销。
+        t = _trajectory_render(c, nid, relative=False)
+        if t:
+            lines.append(f"   🧭 轨迹: {t}")
+        return lines
+
     # Structured fields (may be NULL for legacy entries)
     gesture = r["gesture"] if "gesture" in r.keys() and r["gesture"] else None
     weight  = r["weight"]  if "weight"  in r.keys() and r["weight"]  is not None else None
@@ -374,21 +1016,28 @@ def _fmt_narrative(r):
         if cog:  parts.append(f"   🧭 {cog}")
         if ent:
             ents = json.loads(ent) if ent else []
-            if ents: parts.append(f"   👤 {', '.join(ents)}")
+            if ents: parts.append(f"   👤 {', '.join(str(x) for x in ents)}")
         if links:
+            # source_links may contain ints (backfill wrote raw SQLite ids) —
+            # coerce to str before join. Found 2026-08-15: int links crashed
+            # ', '.join() and took down the ENTIRE memory_search tool, since
+            # semantic search scans all narratives and hits any bad row.
             lks = json.loads(links) if links else []
             if lks: parts.append(f"   🔗 {', '.join(str(x) for x in lks)}")
         w_str = f"  w={weight:.2f}" if weight else ""
         parts.append(f"   [{r['created_at']}]{w_str}")
+        parts.extend(_amend_lines(r["id"]))   # v2.6: 修订层叠在最底
         return "\n".join(parts)
     else:
         # Legacy free-text entry
         tags = json.loads(r["tags"]) if r["tags"] else []
-        tag_str = f"  tags: {', '.join(tags)}" if tags else ""
+        tag_str = f"  tags: {', '.join(str(t) for t in tags)}" if tags else ""
         preview = r["content"][:300]
         if len(r["content"]) > 300:
             preview += "..."
-        return f"[{r['created_at']}] [{r['ntype']}] {preview}{tag_str}"
+        base = f"[{r['created_at']}] [{r['ntype']}] {preview}{tag_str}"
+        amend = _amend_lines(r["id"])   # v2.6: 旧格式条目同样叠层
+        return "\n".join([base] + amend) if amend else base
 
 def _fmt_context(r):
     meta = json.loads(r["meta"]) if r["meta"] else {}
@@ -464,6 +1113,73 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
             "required": ["gesture"],
+        },
+    ),
+
+    types.Tool(
+        name="memory_amend",
+        description=(
+            "📝 给既有记忆追加修订（amendment）——不是编辑。条目全不可变，"
+            "修订作为带时间戳的补层叠上去：过期理解不消失，看得见层次。"
+            "适用于：认知更新（'从X切换到Y'的Y变了）、纠错、补充后来才知道的事实。"
+            "绝对不要用它改写原条目的意思——要记录的是'我现在知道当时理解错了'，"
+            "不是抹掉当时的理解。跟 memory_write 的分工：write 造新记忆，"
+            "amend 给旧记忆贴新便签。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "narrative_id": {
+                    "type": "integer",
+                    "description": "要修订的叙事条目 id",
+                },
+                "amendment": {
+                    "type": "string",
+                    "description": "修订内容——第一人称，写现在怎么看这条记忆",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "修订触发源（新证据/她的纠正/时间证明…）",
+                },
+            },
+            "required": ["narrative_id", "amendment"],
+        },
+    ),
+
+    types.Tool(
+        name="memory_traj_promote",
+        description=(
+            "🧭 [DREAM固化层] 轨迹升格：把机械垫底轨迹重写成自然语言事件链。"
+            "每晚固化层调用——列出cast='mech'的待升格轨迹，读原narrative和"
+            "全部amendment，把「时间戳+截断文本」重写成「n天前，一句话事件＋"
+            "想法（带原始关键词）」的循环链。每段必须保留原始narrative的关键词"
+            "作为检索锚（捞回全文的入口）。写法：第一人称，存温度，不是机械摘要。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "write"],
+                    "description": "list=查待升格轨迹清单；write=写回升格后的轨迹",
+                },
+                "narrative_id": {
+                    "type": "integer",
+                    "description": "write时必填：目标条目id",
+                },
+                "events": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ts": {"type": "string", "description": "事件时间戳（保持原段ts不变）"},
+                            "text": {"type": "string", "description": "一句话事件＋想法，带原始关键词锚"},
+                        },
+                    },
+                    "description": "write时必填：升格后的轨迹事件链[{ts,text}]",
+                },
+            },
+            "required": ["action"],
         },
     ),
 
@@ -748,7 +1464,7 @@ async def _dispatch(name, a, c):
         context_layer = a.get("context", "")
         moment_val = a.get("moment", "")
         cog_dir = a.get("cognition_direction", "")
-        links = [str(x) for x in a.get("source_links", []) if str(x).strip()]
+        links = a.get("source_links", [])
         tags = a.get("tags", [])
         entities_role = a.get("entities_role", "")
         ntype = a.get("narrative_type", "general")
@@ -786,6 +1502,7 @@ async def _dispatch(name, a, c):
         # build content for embedding & FTS (structured combo)
         parts = [p for p in [gesture, context_layer, moment_val, cog_dir] if p]
         content = " | ".join(parts) if parts else (a.get("content", "") or gesture)
+        _reject_empty(content, "memory_write")  # 全字段为空=空记忆，不落库
 
         # build embedding from gesture + cognition_direction (most semantic info)
         emb = await _embed(content)
@@ -806,7 +1523,7 @@ async def _dispatch(name, a, c):
                VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?,?)""",
             (content, ntype, json.dumps(tags, ensure_ascii=False), json.dumps(emb) if emb else None, _now(),
              gesture, context_layer, moment_val, cog_dir,
-             json.dumps(related, ensure_ascii=False), json.dumps(links), entities_role,
+             json.dumps(related, ensure_ascii=False), json.dumps([str(x) for x in links]), entities_role,
              weight, imp, emo, rec, unr),
         )
         c.commit()
@@ -866,6 +1583,84 @@ async def _dispatch(name, a, c):
         return [types.TextContent(type="text",
             text=f"✅ 已记录。weight={weight:.2f} | 标签: {tags}")]
 
+    # ── memory_amend (v2.6) ──
+    if name == "memory_amend":
+        nid = a["narrative_id"]
+        amendment = _reject_empty(a.get("amendment"), "memory_amend")
+        reason = a.get("reason") or ""
+
+        # 目标必须存在——给不存在的记忆贴便签是静默丢数据
+        row = c.execute("SELECT id, gesture FROM narratives WHERE id = ?", (nid,)).fetchone()
+        if not row:
+            return [types.TextContent(type="text",
+                text=f"❌ 记忆 #{nid} 不存在。修订只能贴在已有条目上。")]
+
+        c.execute(
+            "INSERT INTO amendments(narrative_id, amendment, reason, created_at) VALUES(?,?,?,?)",
+            (nid, amendment, reason, _now()),
+        )
+        # 修订本体先落盘——铸向量是增强不是前置条件，任何下游失败
+        # 都不能让用户看到「✅已叠加」而数据实际回滚（真跑自查抓的雷）。
+        c.commit()
+        # v2.7: 修订落地即铸修订向量（边表）——修订进检索是义务。
+        # 走 _ensure_amvec_sync 单一来源：顺手把同条目历史漏铸的一起补上。
+        # 铸不上不挡修订写入——FTS 仍能命中，下次 amend/查询/DREAM 再补。
+        try:
+            await _ensure_amvec_sync(c, [nid])
+        except Exception:
+            pass
+        # v2.8: 修订落地同事务重算机械轨迹（垫底层）——任何时刻注入有轨迹。
+        # 已有llm升格被新amend作废回mech，等DREAM夜扫重升格（故事重讲）。
+        try:
+            _rebuild_traj_mech(c, nid)
+            c.commit()
+        except Exception:
+            pass  # 轨迹失败不挡修订——下次amend/DREAM再补
+
+        n = c.execute(
+            "SELECT COUNT(*) AS n FROM amendments WHERE narrative_id = ?", (nid,)
+        ).fetchone()["n"]
+        return [types.TextContent(type="text",
+            text=f"✅ 修订已叠加到 #{nid}（第{n}层）：{amendment[:80]}{'…' if len(amendment) > 80 else ''} | 原因: {reason or '未注明'}")]
+
+    # ── memory_traj_promote (v2.8 DREAM升格层) ──
+    if name == "memory_traj_promote":
+        action = a.get("action")
+        if action == "list":
+            rows = _traj_pending(c, limit=50)
+            if not rows:
+                return [types.TextContent(type="text",
+                    text="🧭 没有待升格的轨迹（全部已是llm或还没有轨迹）。")]
+            lines = ["🧭 待升格轨迹（cast='mech'）：\n"]
+            for r in rows:
+                # 附上机械轨迹内容供DREAM直接读——省一次查询
+                rendered = _trajectory_render(c, r["narrative_id"], relative=False)
+                lines.append(f"#{r['narrative_id']}（{r['n_events']}段）: {rendered}")
+            return [types.TextContent(type="text", text="\n\n".join(lines))]
+        if action == "write":
+            nid = a.get("narrative_id")
+            events = a.get("events")
+            if nid is None or not events:
+                return [types.TextContent(type="text",
+                    text="❌ write 需要 narrative_id 和 events。")]
+            # 目标必须存在且当前是mech——llm→llm覆盖是异常路径：
+            # 正常流里新amend已把旧llm作废回mech，llm态收到write=重复升格。
+            row = c.execute(
+                "SELECT cast_state FROM trajectories WHERE narrative_id = ?", (nid,)).fetchone()
+            if not row:
+                return [types.TextContent(type="text",
+                    text=f"❌ #{nid} 没有轨迹可升格（先amend产生机械轨迹）。")]
+            if row["cast_state"] != "mech":
+                return [types.TextContent(type="text",
+                    text=f"⏭️ #{nid} 已是llm轨迹，跳过（新amend会作废回mech再升格）。")]
+            ok = _save_traj_llm(c, nid, events)
+            c.commit()
+            if ok:
+                return [types.TextContent(type="text",
+                    text=f"✅ 轨迹已升格为llm（#{nid}，{len(events)}段）。")]
+            return [types.TextContent(type="text",
+                text="❌ 轨迹校验失败（空事件/畸形）——mech垫底保留，注入不受影响。")]
+
     # ── memory_recall ──
     if name == "memory_recall":
         ntype = a.get("narrative_type")
@@ -886,7 +1681,7 @@ async def _dispatch(name, a, c):
             return [types.TextContent(type="text", text="📖 还没有记忆。用 memory_write 写第一条吧。")]
         lines = [f"📖 最近 {len(rows)} 条记忆：\n"]
         for r in rows:
-            lines.append(_fmt_narrative(r))
+            lines.append(_fmt_narrative(r, c))
         
         # ── Log recall as passive attention (browsing, no query) ──
         recall_scored = [(0.0, r) for r in rows]
@@ -898,7 +1693,8 @@ async def _dispatch(name, a, c):
     if name == "memory_write_profile":
         entity = a["entity"]
         ptype = a.get("profile_type", "impression")
-        content = a["content"]
+        content = _reject_empty(a.get("content"), "memory_write_profile")
+        _archive_if_overwritten(c, "profiles", ["entity", "ptype"], [entity, ptype])
         c.execute(
             """INSERT INTO profiles(entity,ptype,content,updated_at)
                VALUES(?,?,?,?)
@@ -911,7 +1707,8 @@ async def _dispatch(name, a, c):
     # ── memory_write_self_concept (v2.3) ──
     if name == "memory_write_self_concept":
         field = a["field"]
-        content = a["content"]
+        content = _reject_empty(a.get("content"), "memory_write_self_concept")
+        _archive_if_overwritten(c, "self_concept", ["field"], [field])
         c.execute(
             """INSERT INTO self_concept(field,content,updated_at)
                VALUES(?,?,?)
@@ -933,7 +1730,7 @@ async def _dispatch(name, a, c):
 
     # ── memory_write_thread (v2.3) ──
     if name == "memory_write_thread":
-        content = a["content"]
+        content = _reject_empty(a.get("content"), "memory_write_thread")
         imp = a.get("importance", 3)
         emo = a.get("emotional", 3)
         rec = a.get("recurrence", 3)
@@ -1019,20 +1816,24 @@ async def _dispatch(name, a, c):
                 text=f"👁️ 注意力分布（{days}天）\n\n暂无数据。注意力追踪刚启用，需要几轮对话积累。")]
 
         total = sum(r["hits"] for r in rows)
-        lines = [f"👁️ 注意力分布（{days}天，共{total}次命中）\n"]
+        lines = [f"👁️ 注意力分布（{days}天，共{total}次命中）"]
+        lines.append("📖 读图须知：① 命中按行计——一次搜索会点亮几十条记忆，行数大≠被问得多；每晚约02:00(北京)有一次全库扫描（洒水车），看来源分布时请记住它的存在。② 时间戳为UTC，北京+8。③ 『从未照亮』按簇名口径——簇没亮过≠记忆本体没被照过，本体可能天天被别的路径扫到。")
+        lines.append("")
         for r in rows:
             pct = r["hits"] / total * 100
             bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
             avg = f"{r['avg_sim']:.2f}" if r["avg_sim"] else "N/A"
             lines.append(f"  {r['cluster_name']:20s} {bar} {r['hits']:4d} ({pct:4.1f}%) sim={avg}")
 
-        # ── Source breakdown (v2.4: active vs passive attention) ──
+        # ── Source breakdown (v2.5: dual-caliber — rows AND ≈calls) ──
         try:
             source_rows = c.execute("""
-                SELECT source, COUNT(*) as cnt FROM attention_log
+                SELECT source, COUNT(*) AS cnt, COUNT(DISTINCT created_at) AS calls
+                FROM attention_log
                 WHERE created_at > ? GROUP BY source ORDER BY cnt DESC
             """, (cutoff,)).fetchall()
             if source_rows and len(source_rows) > 1:
+                total_calls = sum(sr["calls"] for sr in source_rows) or 1
                 source_labels = {
                     "t1_prefetch": "T1语义检索（主动）",
                     "t0_inject": "T0权重注入（被动）",
@@ -1040,20 +1841,34 @@ async def _dispatch(name, a, c):
                     "mcp_recall": "MCP浏览（被动）",
                     "dream": "DREAM检索",
                 }
-                lines.append(f"\n  📊 来源分布:")
+                lines.append(f"\n  📊 来源分布（按行数 ｜ 按≈次数=时间戳去重）:")
                 for sr in source_rows:
                     pct = sr["cnt"] / total * 100
+                    cpct = sr["calls"] / total_calls * 100
                     label = source_labels.get(sr["source"], sr["source"])
-                    lines.append(f"    {label}: {sr['cnt']} ({pct:.1f}%)")
+                    lines.append(f"    {label}: {sr['cnt']}行 ({pct:.1f}%) ｜ ≈{sr['calls']}次 ({cpct:.1f}%)")
         except Exception:
             pass  # source column may not exist on older logs
 
-        # Detect deserts
-        all_clusters = c.execute("SELECT cluster_name FROM topic_clusters").fetchall()
-        lit = {r["cluster_name"] for r in rows}
-        deserts = [r[0] for r in all_clusters if r[0] not in lit]
+        # Detect deserts — fixed 2026-09-06: attention_log stores composite
+        # names ("jieba:词 | emb:#N,N,N"), topic_clusters stores plain words.
+        # The old direct `not in` compared mismatched namespaces and listed
+        # EVERY cluster as never-illuminated (3243/3243 at time of fix).
+        # Now: match on the word part, sort by noun_freq so meaningful
+        # deserts surface first, cap the list for readability.
+        all_clusters = c.execute(
+            "SELECT cluster_name, noun_freq FROM topic_clusters ORDER BY noun_freq DESC"
+        ).fetchall()
+        lit_words = set()
+        for r in rows:
+            name = r["cluster_name"]
+            if name.startswith("jieba:"):
+                lit_words.add(name[6:].split(" | ")[0].strip())
+        deserts = [r["cluster_name"] for r in all_clusters if r["cluster_name"] not in lit_words]
         if deserts:
-            lines.append(f"\n  ⚠ 从未被照亮: {', '.join(deserts)}")
+            shown = ", ".join(deserts[:50])
+            more = f" ……共{len(deserts)}个" if len(deserts) > 50 else ""
+            lines.append(f"\n  ⚠ 从未被照亮（{len(deserts)}/{len(all_clusters)}簇）: {shown}{more}")
 
         return [types.TextContent(type="text", text="\n".join(lines))]
 
@@ -1228,9 +2043,27 @@ async def _dispatch(name, a, c):
 
         # 1. Keyword search — context (FTS5 + LIKE fallback, with time filter)
         for r in _kw_search(c, query, limit=limit*2, time_filter=time_filter, time_params=time_params):
-            results.append((1.0, "🔑上下文", _fmt_context(r), 0.3))
+            results.append((1.0, "🔑上下文", _fmt_context(r), 0.3, None))
 
-        # 2. Keyword search — narratives (LIKE, with time filter)
+        # 2. Keyword search — narratives (v2.7: FTS + LIKE 双写；amendment 命中映射回原条目)
+        # narratives_fts 覆盖 gesture/context_layer/cognition_direction/tags 四列，
+        # content（拼好的结构化组合）不进 FTS——LIKE 兜底继续查它，两条一起
+        # 送到 dedup（zhaozhao：FTS/LIKE 两条一起补，别只补 FTS）。
+        try:
+            _ensure_amfts_sync(c)
+            nar_kw_fts_sql = """SELECT n.* FROM narratives_fts f
+                   JOIN narratives n ON n.id = f.rowid
+                   WHERE narratives_fts MATCH ?"""
+            nar_kw_fts_params = [f'"{query}"']
+            if since:
+                nar_kw_fts_sql += " AND n.created_at >= ?"
+                nar_kw_fts_params.append(since)
+            if until:
+                nar_kw_fts_sql += " AND n.created_at <= ?"
+                nar_kw_fts_params.append(until)
+            nar_kw_fts = c.execute(nar_kw_fts_sql, nar_kw_fts_params).fetchall()
+        except Exception:
+            nar_kw_fts = []
         nar_sql = "SELECT * FROM narratives WHERE content LIKE ?"
         nar_params = [f"%{query}%"]
         if since:
@@ -1241,9 +2074,53 @@ async def _dispatch(name, a, c):
             nar_params.append(until)
         nar_sql += " ORDER BY created_at DESC LIMIT ?"
         nar_params.append(limit)
-        nar_kw = c.execute(nar_sql, nar_params).fetchall()
+        nar_kw_like = c.execute(nar_sql, nar_params).fetchall()
+        nar_kw = _dedup_rows_by_id(nar_kw_fts + nar_kw_like)
         for r in nar_kw:
-            results.append((1.0, "🔑记忆", _fmt_narrative(r), 0.3))
+            results.append((1.0, "🔑记忆", _fmt_narrative(r, c), 0.3, r["id"]))
+
+        # 2b. v2.7: amendment 关键词命中（FTS）映射回原条目——修订进检索是义务
+        # FTS miss（含 <3 字短查询 trigram 够不着）与 FTS 异常同样走 LIKE 兜底
+        # ——_kw_search 同款模式：FTS 是快路不是唯一路。
+        am_hits = []
+        try:
+            am_fts_sql = """SELECT n.* FROM amendments_fts f
+                   JOIN amendments a ON a.id = f.rowid
+                   JOIN narratives n ON n.id = a.narrative_id
+                   WHERE amendments_fts MATCH ?"""
+            am_fts_params = [f'"{query}"']
+            if since:
+                am_fts_sql += " AND a.created_at >= ?"
+                am_fts_params.append(since)
+            if until:
+                am_fts_sql += " AND a.created_at <= ?"
+                am_fts_params.append(until)
+            am_hits = c.execute(am_fts_sql, am_fts_params).fetchall()
+        except Exception:
+            am_hits = []
+        if not am_hits:
+            am_like_sql = """SELECT n.* FROM narratives n JOIN amendments a ON a.narrative_id = n.id
+                   WHERE (a.amendment LIKE ? OR a.reason LIKE ?)"""
+            am_like_params = [f"%{query}%", f"%{query}%"]
+            if since:
+                am_like_sql += " AND a.created_at >= ?"
+                am_like_params.append(since)
+            if until:
+                am_like_sql += " AND a.created_at <= ?"
+                am_like_params.append(until)
+            am_like_sql += " ORDER BY a.created_at DESC LIMIT ?"
+            am_like_params.append(limit)
+            am_hits = c.execute(am_like_sql, am_like_params).fetchall()
+        am_kw = _dedup_rows_by_id(am_hits)
+        # 查询触发的 lazy 补铸（#383③/#431）：关键词命中修订 = 「值得现场铸」
+        # 的信号——没命中不花钱。铸不上不挡查询（_ensure_amvec_sync 自吞异常）。
+        if am_kw:
+            try:
+                await _ensure_amvec_sync(c, [r["id"] for r in am_kw])
+            except Exception:
+                pass
+        for r in am_kw:
+            results.append((1.0, "🔑记忆·修订", _fmt_narrative(r, c), 0.3, r["id"]))
 
         # 3. Semantic search (supplements keyword matches, with time filter)
         nar_sem_hits = []  # collect semantic hits for attention tracking
@@ -1261,8 +2138,18 @@ async def _dispatch(name, a, c):
             for r in c.execute(nar_sem_sql, nar_sem_params).fetchall():
                 score = _cosine(emb, json.loads(r["embedding"]))
                 if score > 0.3:
-                    results.append((score, "🧠记忆", _fmt_narrative(r), 0))
+                    results.append((score, "🧠记忆", _fmt_narrative(r, c), 0, r["id"]))
                     nar_sem_hits.append((score, r))
+
+            # 3b. v2.7: 修订向量路——边表扫描，命中映射回原条目。
+            # 旧向量不动（当时的错理解也是可检索的历史），任一命中都召回
+            # 原条目；末端按 narrative_id 收敛取 max（#391/#393）。
+            # v2.7.2: 扫描抽成 _amvec_scan，按 model_ns 过滤（mingmingP3）。
+            try:
+                for vscore, row in _amvec_cosine_hits(c, emb, since, until):
+                    results.append((vscore, "🧠记忆·修订", _fmt_narrative(row, c), 0, row["id"]))
+            except sqlite3.OperationalError:
+                pass  # 老库无 amendment_vectors——修订向量路静默跳过
 
             ctx_sem_sql = "SELECT * FROM context WHERE embedding IS NOT NULL"
             ctx_sem_params = []
@@ -1279,19 +2166,22 @@ async def _dispatch(name, a, c):
                 scored.append((_cosine(emb, json.loads(r["embedding"])), r))
             scored.sort(key=lambda x: -x[0])
             for score, r in scored[:limit]:
-                results.append((score, "🧠上下文", _fmt_context(r), 0))
+                results.append((score, "🧠上下文", _fmt_context(r), 0, None))
 
         if not results:
             return [types.TextContent(type="text", text=f"🔍 没找到和 \"{query}\" 相关的内容。")]
 
-        # Deduplicate by content preview, sort with keyword boost
-        seen = set()
-        deduped = []
-        for score, source_text, text, boost in results:
-            key = text[:80]
-            if key not in seen:
-                seen.add(key)
-                deduped.append((score, source_text, text, boost))
+        # v2.7 收敛：narrative 按 id 收敛取 max，不再按 text[:80]。
+        # 旧键的两种病（#386/#387）：修订动在80字后→修订行与原文行同形被吃；
+        # 同条目多路命中→靠占位次数顶位。收敛键换成 id 后连根治：
+        # 得分定排序、时序定回显（回显文本已在各路生成时走叠层格式，
+        # 带全部 📝 修订层——命中的不管是本体还是修订向量，吐的都是叠层生效态）。
+        best = {}  # key -> (score, source, text, boost)
+        for score, source, text, boost, rid in results:
+            key = ("n", rid) if rid is not None else ("c", text[:80])
+            if key not in best or (score + boost) > (best[key][0] + best[key][3]):
+                best[key] = (score, source, text, boost)
+        deduped = list(best.values())
         deduped.sort(key=lambda x: -(x[0] + x[3]))
         
         # ── Log memory_search narrative hits as attention ──

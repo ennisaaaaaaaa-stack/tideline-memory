@@ -34,3 +34,7 @@ Thumbs.db
 # Local-only content (not for open source)
 marketing/
 plugins/_persona_override.py
+logs/
+dream-stages/
+import_wire_watermark.json
+*.bak-*

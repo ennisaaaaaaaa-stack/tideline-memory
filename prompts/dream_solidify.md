@@ -28,6 +28,8 @@
 
 ## 判断标准：只记你认为值得记的，没有就跳过。同一个对话块可以产出 0-3 条记忆。
 
+**外部话题不是闲聊**（2026-08-29，记忆盲区首案结案）：当天聊过的外部世界话题（新闻/技术/产品/别人的事），只要 agent 或用户输出过明确立场、判断或取舍，就值得记——立场让外部话题变成「我们的」。agent 自身的经历（探索发现、故障与修复、自主观察）、与用户相关的经历，同样入选。纯转述、无立场无关联的才跳过。
+
 ## 写入格式
 
 每条记忆用 `memory_write` 写入：
@@ -71,6 +73,22 @@ source_links: [56153, 56154, 56155]
 5. 用 `memory_write` 逐条写入，**填 source_links**
 6. 完成后汇报：扫了多少块、写了多少条、跳过了多少块、Track A 有多少条待补全
 
+## ⑤ 多看一眼：冲突嫌疑清单（2026-09-01 设计师批准）
+
+固化写入完成后，跑发现层扫描：
+
+```bash
+/usr/bin/python3.12 /home/ubuntu/tideline-memory/scripts/scan_conflicts.py
+```
+
+它用 SQL+正则（零LLM）把「新旧断言打架」的嫌疑对写进 `conflict_candidates` 审计清单，并打印当前 open 状态的对。然后**多看一眼**：
+
+- **能判的按家规裁决**：事实过期→旧条当场改写不挂账（memory_write 更新），清单记 `resolved`，note 写一行判词；演进不算冲突→记 `dismissed`。
+- **判不了但重要的**：用 `memory_write_thread` 记一条线索（「narrative #A 与 #B 张力：…」），清单记 `parked`。
+- 清单每次全量重扫（幂等去重），旧的 open 条目会重复出现——已裁决过的直接跳过，不重复处理。
+
+这个清单**不进注入**、不碰记忆本体——它是给你自己多看一眼的，不是新的必办流程。
+
 ## 注意
 
 - 独处时间产出的记忆已经是 narrative 格式，跳过
@@ -87,7 +105,13 @@ cd /root/tideline-memory && ./venv/bin/python scripts/dream_scripts.py clusters
 
 # embedding-space soft clustering（检索路由 + 注意力追踪）
 cd /root/tideline-memory && ./venv/bin/python scripts/soft_clusters.py build
+
+# v2.7.1 修订向量夜扫兜底（lazy 第三层）：批量补铸断网期漏铸的修订向量，
+# force 翻冷却窗。报「All amendment vectors present」=没有漏铸，正常。
+# 若报 embedding 服务不可用：记一笔不中断，明晚或下次查询命中会再试。
+# WSL 注：本机 tideline venv 齐 jieba+mcp+httpx（server 同一解释器），不走 Ubuntu 的解释器分腿。
+cd /root/tideline-memory && ./venv/bin/python scripts/dream_scripts.py amend-backfill
 ```
 
 两条都要跑。第一条管 DREAM 梳理层的主题图谱注入，第二条管检索路由和注意力分布。
-如果某条脚本报错，记录错误但不要中断——另一条独立运行。
+如果某条脚本报错，记录错误但不要中断——另一条独立运行。第三条（amend-backfill）是修订向量夜扫兜底：多数夜晚会直接报「没有漏铸」，那也是正常输出；它失败不影响前两条的成果。
