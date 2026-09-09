@@ -42,11 +42,17 @@ async def main():
 
     # ── 14a 机械垫底：amend → mech轨迹同事务 ──────────────────
     print("── 14a 机械垫底层 ──")
+    # 14c-1 的相对时间断言（7天前/昨天）依赖本体时间戳——硬编码绝对日期会让
+    # 测试随日历腐烂（9/8写的时候是7天前，今天跑就成8天前）。改成相对计算，
+    # 测试从此日期无关。（2026-09-10 点火夜拆弹）
+    from datetime import datetime, timedelta, timezone
+    base_ts = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     nid = c.execute(
         "INSERT INTO narratives(ntype, gesture, context_layer, moment,"
         " cognition_direction, content, tags, created_at)"
         " VALUES('memory','甜心设计轨迹压缩spec注入侧不抢context','背景','时刻',"
-        "'从全文堆叠切换到轨迹链','全文','[\"轨迹压缩\",\"甜心\"]','2026-09-01 10:00:00')"
+        "'从全文堆叠切换到轨迹链','全文','[\"轨迹压缩\",\"甜心\"]',?)",
+        (base_ts,)
     ).lastrowid
     c.commit()
     # amend前无轨迹
