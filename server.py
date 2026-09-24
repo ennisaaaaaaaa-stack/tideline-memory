@@ -1705,9 +1705,14 @@ async def _dispatch(name, a, c):
             sql += " AND ntype = ?"
             params.append(ntype)
         if tags:
-            tag_conds = " OR ".join(["tags LIKE ?" for _ in tags])
+            # 2026-09-24 拟稿②：tags 从 LIKE '%"t"%' 改为 json_each 精确判等——
+            # LIKE 对 \u 转义存储的历史 tag 全盲（正文匹配不上），且大小写不敏感会混入
+            # 近义 tag（如 Portalk/portalk）。json_each 解析后按值判等，两个问题一起解。
+            tag_conds = " OR ".join([
+                "EXISTS (SELECT 1 FROM json_each(COALESCE(tags,'[]')) WHERE json_each.value = ?)"
+                for _ in tags])
             sql += f" AND ({tag_conds})"
-            params.extend([f'%"{t}"%' for t in tags])
+            params.extend(tags)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
         rows = c.execute(sql, params).fetchall()
@@ -2103,8 +2108,14 @@ async def _dispatch(name, a, c):
             nar_kw_fts = c.execute(nar_kw_fts_sql, nar_kw_fts_params).fetchall()
         except Exception:
             nar_kw_fts = []
-        nar_sql = "SELECT * FROM narratives WHERE content LIKE ?"
-        nar_params = [f"%{query}%"]
+        # 2026-09-24 拟稿①：narratives LIKE 兜底从只扫 content 扩到五列——
+        # gesture/context_layer/moment/cognition_direction 里命中也算（可空列 COALESCE 包裹）。
+        nar_sql = ("SELECT * FROM narratives WHERE content LIKE ?"
+                   " OR COALESCE(gesture,'') LIKE ?"
+                   " OR COALESCE(context_layer,'') LIKE ?"
+                   " OR COALESCE(moment,'') LIKE ?"
+                   " OR COALESCE(cognition_direction,'') LIKE ?")
+        nar_params = [f"%{query}%"] * 5
         if since:
             nar_sql += " AND created_at >= ?"
             nar_params.append(since)
