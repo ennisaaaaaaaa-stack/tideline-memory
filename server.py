@@ -1231,7 +1231,10 @@ async def list_tools() -> list[types.Tool]:
             "  relationship  我和ta的关系结构描述\\n\\n"
             "⚠️ 注意归属：多人协作场景要核实每个行为归到正确的实体。"
             "可在 entities_role 字段里追溯，如有矛盾/不确定，可核查 source_links。"
-            "\\n\\n"
+            "\n\n"
+            "人称：写他人=第三人称观察者语法；写自己（entity=self）=第一人称——"
+            "'我'的档案由'我'来写，不把自己写成第三方研究对象。"
+            "\n\n"
             "每次写入会更新对应字段（DREAM 里 LLM 也可以更新）。"
         ),
         inputSchema={
@@ -1253,6 +1256,11 @@ async def list_tools() -> list[types.Tool]:
         name="memory_write_self_concept",
         description=(
             "🧬 更新自我概念——从所有记忆中归纳的稳定身份结构。\\n\\n"
+            "写法：第一人称。归纳的对象是我自己——我是这套结构的作者，"
+            "不是被归档的标本。写「我」不写自己的名字："
+            "自己的观察由'我'落笔（如'我数完了这些'），"
+            "不让名字以第三人称出现在自己的档案里。"
+            "像给自己写长期的自我观察笔记，不像给研究对象立案卷。\\n\\n"
             "三字段：\\n"
             "  fact              关于我的事实（VPS配置、底模、能力清单）\\n"
             "  terrain           地形——行为模式（'效率→自由'）\\n"
@@ -1361,6 +1369,7 @@ async def list_tools() -> list[types.Tool]:
             "type": "object",
             "properties": {
                 "days": {"type": "integer", "default": 7, "description": "回看天数"},
+                "limit": {"type": "integer", "default": 40, "description": "只列出命中最高的前 N 簇（上限500），防止单次输出过大被工具层落盘成不可读文件（2026-09-12 R77 修复）"},
             },
         },
     ),
@@ -1809,9 +1818,10 @@ async def _dispatch(name, a, c):
                 lines.append(f"   explored: {r['explored_at']}")
         return [types.TextContent(type="text", text="\n".join(lines))]
 
-    # ── memory_attention_heatmap (v2.4) ──
+    # ── memory_attention_heatmap (v2.4; 2026-09-12 R77 加 limit 截断) ──
     if name == "memory_attention_heatmap":
         days = a.get("days", 7)
+        limit = min(max(int(a.get("limit", 40)), 1), 500)
         from datetime import datetime, timezone, timedelta
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
@@ -1841,14 +1851,18 @@ async def _dispatch(name, a, c):
                 text=f"👁️ 注意力分布（{days}天）\n\n暂无数据。注意力追踪刚启用，需要几轮对话积累。")]
 
         total = sum(r["hits"] for r in rows)
-        lines = [f"👁️ 注意力分布（{days}天，共{total}次命中）"]
+        lines = [f"👁️ 注意力分布（{days}天，共{total}次命中，{len(rows)}簇）"]
         lines.append("📖 读图须知：① 命中按行计——一次搜索会点亮几十条记忆，行数大≠被问得多；每晚约02:00(北京)有一次全库扫描（洒水车），看来源分布时请记住它的存在。② 时间戳为UTC，北京+8。③ 『从未照亮』按簇名口径——簇没亮过≠记忆本体没被照过，本体可能天天被别的路径扫到。")
         lines.append("")
-        for r in rows:
+        shown_rows = rows[:limit]
+        for r in shown_rows:
             pct = r["hits"] / total * 100
             bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
             avg = f"{r['avg_sim']:.2f}" if r["avg_sim"] else "N/A"
             lines.append(f"  {r['cluster_name']:20s} {bar} {r['hits']:4d} ({pct:4.1f}%) sim={avg}")
+        if len(rows) > limit:
+            hidden_pct = sum(r["hits"] for r in rows[limit:]) / total * 100
+            lines.append(f"  …（其余 {len(rows) - limit} 簇共 {hidden_pct:.1f}% 命中已折叠，传 limit=N 展开）")
 
         # ── Source breakdown (v2.5: dual-caliber — rows AND ≈calls) ──
         try:
