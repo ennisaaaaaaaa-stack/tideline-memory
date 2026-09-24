@@ -25,7 +25,7 @@ DEFAULT_DB = Path.home() / "memory" / "mcp_memory.db"
 import os
 _KNOWN = os.environ.get(
     "KNOWN_PERSONS",
-    "设计师,zhaozhao,hui,mingming,ZCode,kimi3,Eve,Tim King",
+    "设计师,zhaozhao,hui,mingming,琴师,ZCode,kimi3,Eve,Tim King",
 )
 KNOWN_PERSONS = {p.strip() for p in _KNOWN.split(",") if p.strip()}
 
@@ -151,10 +151,14 @@ def rebuild_graph(db_path: Path):
     """)
 
     # Fetch all narratives with entities_role
+    # v3 (2026-09-25 独处层zhaozhao — tags fallback):
+    #   entities_role coverage is ~30% (128/421); rows without it were
+    #   skipped entirely, freezing 琴师 at first=last=9/22 despite 20 tag
+    #   mentions. Now: tags ∩ KNOWN_PERSONS also enter the graph as
+    #   co-occurrence (roles empty), matching v2 chain-format semantics.
     rows = db.execute("""
-        SELECT id, entities_role, created_at
+        SELECT id, entities_role, tags, created_at
         FROM narratives
-        WHERE entities_role IS NOT NULL AND entities_role != ''
         ORDER BY created_at
     """).fetchall()
 
@@ -167,6 +171,15 @@ def rebuild_graph(db_path: Path):
 
     for r in rows:
         parsed = parse_entities_role(r["entities_role"])
+        if not parsed and r["tags"]:
+            # tags fallback: known persons in tags co-occur, roles empty
+            try:
+                tag_list = json.loads(r["tags"])
+            except (ValueError, TypeError):
+                tag_list = []
+            known = [t for t in tag_list if t in KNOWN_PERSONS]
+            if known:
+                parsed = {ent: "" for ent in known}
         if not parsed:
             continue
 
