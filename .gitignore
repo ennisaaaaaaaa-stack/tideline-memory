@@ -38,3 +38,6 @@ logs/
 dream-stages/
 import_wire_watermark.json
 *.bak-*
+
+# Local scratch experiments (never publish)
+scratch/
