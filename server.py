@@ -190,9 +190,16 @@ def _init():
         amendment TEXT NOT NULL,
         reason TEXT,
         created_at TEXT NOT NULL,
+        view_state TEXT,
         FOREIGN KEY (narrative_id) REFERENCES narratives(id)
     );
     CREATE INDEX IF NOT EXISTS idx_amendments_nid ON amendments(narrative_id, created_at);
+    -- v2.9 (2026-10-02): view_state 视线记录层——amend 时记下「改前最后视线」。
+    -- 旧库迁移在 executescript 之外（见 _init 末尾 ALTER）。
+    -- 背景：R94 覆盖事故根因=看着自己的恢复稿写、没看原档；读侧
+    -- attention_log 54万行已覆盖，写侧修订缺视线。「verified twice」是
+    -- 关于程序的主张而程序本身可能是错的——who/what/why/when 之外
+    -- 还欠「改的时候在看什么」。SpaceChild kannaka-memory 对照启发的补丁。
 
     -- ═══════ v2.7 NEW: amendment_vectors (修订语义边表, 2026-09-07) ═══════
     -- 会审三司拍板（#391/#393/#397/#402）：修订进检索是义务，不是设计取舍。
@@ -374,6 +381,14 @@ def _init():
         VALUES (new.id, new.amendment, new.reason);
     END;
     """)
+
+    # v2.9: 旧库迁移——amendments 补 view_state 列（幂等；
+    # 新库建表段已带列，ALTER 因列已存在而 no-op）
+    try:
+        c.execute("ALTER TABLE amendments ADD COLUMN view_state TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     c.commit(); c.close()
 
 # ─── v2.8 Trajectory (轨迹压缩) ───────────────────────────
@@ -1625,9 +1640,22 @@ async def _dispatch(name, a, c):
             return [types.TextContent(type="text",
                 text=f"❌ 记忆 #{nid} 不存在。修订只能贴在已有条目上。")]
 
+        # v2.9: 改前最后视线——attention_log 里该 nid 最近一次被照亮的
+        # source@时刻(+sim)。从未被照亮=blindspot（空白也是一种视线状态）。
+        # amend 本身不产生照亮，所以连续 amend 记的是同一条视线——如实。
+        _vs = "blindspot:从未被照亮"
+        try:
+            _lit = c.execute(
+                "SELECT source, created_at, sim FROM attention_log WHERE narrative_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (nid,)).fetchone()
+            if _lit:
+                _sim = f"{_lit['sim']:.2f}" if _lit["sim"] is not None else "-"
+                _vs = f"last:{_lit['source']}@{_lit['created_at']}(sim={_sim})"
+        except Exception:
+            _vs = "blindspot:attention_log不可用"
         c.execute(
-            "INSERT INTO amendments(narrative_id, amendment, reason, created_at) VALUES(?,?,?,?)",
-            (nid, amendment, reason, _now()),
+            "INSERT INTO amendments(narrative_id, amendment, reason, created_at, view_state) VALUES(?,?,?,?,?)",
+            (nid, amendment, reason, _now(), _vs),
         )
         # 修订本体先落盘——铸向量是增强不是前置条件，任何下游失败
         # 都不能让用户看到「✅已叠加」而数据实际回滚（真跑自查抓的雷）。
@@ -1651,7 +1679,7 @@ async def _dispatch(name, a, c):
             "SELECT COUNT(*) AS n FROM amendments WHERE narrative_id = ?", (nid,)
         ).fetchone()["n"]
         return [types.TextContent(type="text",
-            text=f"✅ 修订已叠加到 #{nid}（第{n}层）：{amendment[:80]}{'…' if len(amendment) > 80 else ''} | 原因: {reason or '未注明'}")]
+            text=f"✅ 修订已叠加到 #{nid}（第{n}层）：{amendment[:80]}{'…' if len(amendment) > 80 else ''} | 原因: {reason or '未注明'} | 视线: {_vs}")]
 
     # ── memory_traj_promote (v2.8 DREAM升格层) ──
     if name == "memory_traj_promote":
