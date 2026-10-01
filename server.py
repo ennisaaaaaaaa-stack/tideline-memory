@@ -17,6 +17,16 @@ import os, sys, json, math, sqlite3, hashlib, re
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ─── v2.10 器官插槽化第一批 ─────────────────────────────
+# 感官写口（器官→context入境口岸）与 salience 读口（过滤器→Tideline 只读背景）。
+# 两模块自带夹具（tests/fixture_phase18/19），纯函数、零 embed 调用。
+try:
+    import sensory_write
+    import salience_read
+except ImportError:
+    sensory_write = None   # 单文件部署缺模块时 server 仍可跑（工具注册仍展示但调用时报缺）
+    salience_read = None
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
@@ -194,6 +204,10 @@ def _init():
         FOREIGN KEY (narrative_id) REFERENCES narratives(id)
     );
     CREATE INDEX IF NOT EXISTS idx_amendments_nid ON amendments(narrative_id, created_at);
+    -- v2.10 (2026-10-02): 器官插槽化第一批——感官写口 + salience 读口 + pin/ambient 表。
+    -- 表由模块 ensure_* 幂等建（不进这段 executescript），这里只立注释牌。
+    -- 感官写口：器官事件走统一信封进 context 层（meta.type='sensory'），零 schema 改动。
+
     -- v2.9 (2026-10-02): view_state 视线记录层——amend 时记下「改前最后视线」。
     -- 旧库迁移在 executescript 之外（见 _init 末尾 ALTER）。
     -- 背景：R94 覆盖事故根因=看着自己的恢复稿写、没看原档；读侧
@@ -1427,6 +1441,68 @@ async def list_tools() -> list[types.Tool]:
     # ═══════ MCP-B: Full Context ═══════
 
     types.Tool(
+        name="sensory_ingest",
+        description=(
+            "👂 感官事件入境口岸：器官（电台耳朵/摄像头/传感器/RSS）的感知经统一信封"
+            "写入 context 层，走既有固化与检索管线。唯一在门口拦截的是 consent——"
+            "显著性永不拦截（入境≠注意）。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "event": {
+                    "type": "object",
+                    "description": "感官事件信封（ts/organ_id/modality/event_type/payload_summary 必填；confidence/consent_tier/saliency_hint/payload_ref 可选）",
+                    "additionalProperties": True,
+                },
+                "policy": {
+                    "type": "object",
+                    "description": "consent 策略（可选；缺省用 DEFAULT_POLICY——档位待设计师拍板）",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["event"],
+        },
+    ),
+
+    types.Tool(
+        name="sensory_orphans",
+        description=(
+            "🧹 样本库体检：扫描全部 sensory context 行，报悬空的 payload_ref。"
+            "纹理可以过期，引用不可以悬空。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "samples_root": {
+                    "type": "string",
+                    "description": "样本库根目录（默认 ~/memory/samples）",
+                },
+            },
+        },
+    ),
+
+    types.Tool(
+        name="salience_context",
+        description=(
+            "🌊 显著性过滤器问 Tideline 的只读背景通道：事件在此刻对这位 agent 重要吗"
+            "——判定所需的结构化背景（存量认知/pin/社交分层/余光配额/当下状态）"
+            "全部从这条读口出。返回背景材料不打分——打分器住在过滤器插槽（二号槽）。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "event": {
+                    "type": "object",
+ "description": "待判定事件：entities 列表 + 可选 vec 向量（余弦路由用，不传则跳过向量路由）",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["event"],
+        },
+    ),
+
+    types.Tool(
         name="context_record",
         description=(
             "🔮 把此刻的完整上下文存下来——你在做什么、和谁在一起、在想什么。"
@@ -2271,6 +2347,52 @@ async def _dispatch(name, a, c):
         for score, source, text, boost in deduped[:limit * 2]:
             lines.append(f"[{score:.2f}] [{source}] {text}")
         return [types.TextContent(type="text", text="\n\n".join(lines))]
+
+    # ── sensory_ingest (v2.10) ──
+    if name == "sensory_ingest":
+        if sensory_write is None:
+            return [types.TextContent(type="text", text="❌ sensory_write 模块未加载（单文件部署）。")]
+        evt = a["event"]
+        policy = a.get("policy")
+        receipt = sensory_write.ingest(c, evt, policy=policy, now=a.get("now"))
+        c.commit()
+        act = receipt.get("action", "?")
+        if act == "invalid":
+            errs = receipt.get("errors") or ["未知原因"]
+            return [types.TextContent(type="text", text=(
+                f"🚫 信封校验未过（零落行）：\n" +
+                "\n".join(f"   - {e}" for e in errs)
+            ))]
+        icon = {"write_full": "✅", "write_degraded": "🟡", "reject": "🚫"}.get(act, "❓")
+        hint = f"saliency_hint={receipt.get('saliency_hint')}" if receipt.get("saliency_hint") is not None else "hint空（未过滤原始流）"
+        return [types.TextContent(type="text", text=(
+            f"{icon} 感官事件已处理：{act}\n"
+            f"   {hint}\n"
+            f"   {receipt.get('summary', '')}\n"
+            f"   context_id={receipt.get('context_id')}"
+        ))]
+
+    # ── sensory_orphans (v2.10) ──
+    if name == "sensory_orphans":
+        if sensory_write is None:
+            return [types.TextContent(type="text", text="❌ sensory_write 模块未加载（单文件部署）。")]
+        root = a.get("samples_root") or str(Path.home() / "memory" / "samples")
+        orphans = sensory_write.check_orphans(c, root)
+        if not orphans:
+            return [types.TextContent(type="text", text="🧹 干净：零悬空引用。纹理可以过期，引用不可以悬空——今天没有违约。")]
+        lines = [f"🧹 悬空引用 {len(orphans)} 条（不变量违反，非新事件）：\n"]
+        for context_id, ref in orphans[:20]:
+            lines.append(f"   context#{context_id}: {ref}")
+        if len(orphans) > 20:
+            lines.append(f"   …还有 {len(orphans)-20} 条")
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    # ── salience_context (v2.10) ──
+    if name == "salience_context":
+        if salience_read is None:
+            return [types.TextContent(type="text", text="❌ salience_read 模块未加载（单文件部署）。")]
+        background = salience_read.salience_context(c, a["event"])
+        return [types.TextContent(type="text", text="🌊 显著性背景材料：\n" + json.dumps(background, ensure_ascii=False, indent=2))]
 
     # ── context_record ──
     if name == "context_record":
