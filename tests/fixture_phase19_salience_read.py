@@ -21,6 +21,7 @@
 跑法: /home/ubuntu/.hermes/hermes-agent/venv/bin/python tests/fixture_phase19_salience_read.py
 """
 import importlib.util, random, sqlite3, sys, tempfile, time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -177,6 +178,26 @@ def main():
     sr.ensure_pin_registry(conn)   # 再 ensure 一遍：幂等不洗数据
     n_after_ensure = conn.execute("SELECT COUNT(*) FROM pin_registry").fetchone()[0]
     check("V4c ensure 幂等不洗数据", n_after_ensure == 4, f"n={n_after_ensure}")
+
+    # ── V4.1 expires_at 过滤（拍板②主行为，zhaozhao探针指出夹具缺口后补钉 2026-10-04）──
+    # 日期动态生成（夹具永不腐烂）：now 钉死一个已知时刻，过期=now-1天，未过期=now+30天
+    V41_NOW = "2026-10-04T00:00:00Z"
+    conn.execute("INSERT INTO pin_registry(pin_text,weight,active,created_at,expires_at) "
+                 "VALUES('真过期pin（昨天到期）',1.0,1,'2026-09-01T00:00:00Z','2026-10-03T00:00:00Z')")
+    conn.execute("INSERT INTO pin_registry(pin_text,weight,active,created_at,expires_at) "
+                 "VALUES('未过期pin（还有30天）',1.0,1,'2026-09-01T00:00:00Z','2026-11-03T00:00:00Z')")
+    conn.commit()
+    pins3 = sr.pins_snapshot(conn, now=V41_NOW)
+    names3 = [p["pin_text"] for p in pins3]
+    check("V4d 过期滤掉、未过期保留", "真过期pin（昨天到期）" not in names3 and "未过期pin（还有30天）" in names3,
+          f"pins={names3}")
+    check("V4e 边界严格比较：expires_at == now 按过期处理（「>」非「>=」）",
+          all(p["expires_at"] != V41_NOW for p in pins3))
+    # 生产路径（now=None → utcnow）：用真实当前时刻反向钉——过期的进不来
+    prod_snap = sr.pins_snapshot(conn)  # 生产路径真跑
+    check("V4f 生产路径 now=None 真跑：过期 pin 不入快照",
+          all(p["pin_text"] != "真过期pin（昨天到期）" for p in prod_snap),
+          f"prod_n={len(prod_snap)}")
 
     # ── V5 ambient 配额 ──
     print("── V5 余光档配额（3+1 保留席） ──")
