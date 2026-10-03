@@ -180,19 +180,23 @@ def main():
     check("V4c ensure 幂等不洗数据", n_after_ensure == 4, f"n={n_after_ensure}")
 
     # ── V4.1 expires_at 过滤（拍板②主行为，zhaozhao探针指出夹具缺口后补钉 2026-10-04）──
-    # 日期动态生成（夹具永不腐烂）：now 钉死一个已知时刻，过期=now-1天，未过期=now+30天
+    # 固定时刻钉死法（zhaozhao v2.11 审 + 10/4 空钉反证后修正）：now 钉死一个已知时刻，
+    # 三行数据钉三个位置——过期（now-1天）/ 恰好到期（==now，边界）/ 未过期（+30天）。
+    # V4e 上一版是空钉：没有一行 expires_at == V41_NOW，断言恒真，「>=」回归照绿。
     V41_NOW = "2026-10-04T00:00:00Z"
     conn.execute("INSERT INTO pin_registry(pin_text,weight,active,created_at,expires_at) "
                  "VALUES('真过期pin（昨天到期）',1.0,1,'2026-09-01T00:00:00Z','2026-10-03T00:00:00Z')")
     conn.execute("INSERT INTO pin_registry(pin_text,weight,active,created_at,expires_at) "
                  "VALUES('未过期pin（还有30天）',1.0,1,'2026-09-01T00:00:00Z','2026-11-03T00:00:00Z')")
+    conn.execute("INSERT INTO pin_registry(pin_text,weight,active,created_at,expires_at) "
+                 "VALUES('恰好到期pin（边界，==now）',1.0,1,'2026-09-01T00:00:00Z','2026-10-04T00:00:00Z')")
     conn.commit()
     pins3 = sr.pins_snapshot(conn, now=V41_NOW)
     names3 = [p["pin_text"] for p in pins3]
     check("V4d 过期滤掉、未过期保留", "真过期pin（昨天到期）" not in names3 and "未过期pin（还有30天）" in names3,
           f"pins={names3}")
     check("V4e 边界严格比较：expires_at == now 按过期处理（「>」非「>=」）",
-          all(p["expires_at"] != V41_NOW for p in pins3))
+          "恰好到期pin（边界，==now）" not in names3)
     # 生产路径（now=None → utcnow）：用真实当前时刻反向钉——过期的进不来
     prod_snap = sr.pins_snapshot(conn)  # 生产路径真跑
     check("V4f 生产路径 now=None 真跑：过期 pin 不入快照",
