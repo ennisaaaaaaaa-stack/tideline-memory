@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import random
+import sqlite3
 from datetime import datetime, timezone
 
 # ── 常量（默认值，均为可拍板的旋钮） ──────────────────────────────
@@ -239,7 +240,9 @@ def ensure_pin_registry(conn) -> None:
 
     pin 与 threads 的区别：pin 是可随时改的硬约束配置，thread 是 DREAM
     产出的探索方向——pin 不住记忆库，住配置层（spec 开放问题#1）。
-    表结构为默认值，**待设计师拍板（开放问题#1）**。
+    结构=设计师拍板 2026-10-02（同意hui草案）：一条 = 内容 + 权重 +
+    生效(created_at，插入即活) + 过期(expires_at 可空=永久；
+    手动撤=active 置 0)。
     """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pin_registry(
@@ -247,26 +250,40 @@ def ensure_pin_registry(conn) -> None:
             pin_text TEXT NOT NULL,
             weight REAL DEFAULT 1.0,
             active INTEGER DEFAULT 1,
-            created_at TEXT
+            created_at TEXT,
+            expires_at TEXT
         )
     """)
+    # 旧库补列（幂等；列已存在时 ALTER 报错吞掉，参照 view_state 迁移同款）
+    try:
+        conn.execute("ALTER TABLE pin_registry ADD COLUMN expires_at TEXT")
+    except Exception:
+        pass
     conn.commit()
 
 
-def pins_snapshot(conn) -> list:
-    """当前 pin 快照：实时读 active=1 的行（pin 可变性是硬约束，不做缓存）。"""
+def pins_snapshot(conn, now=None) -> list:
+    """当前 pin 快照：实时读 active=1 且未过期的行（pin 可变性是硬约束，不做缓存）。
+
+    now: ISO 字符串，缺省取当前 UTC。expires_at 为空 = 永久
+    （设计师拍板 2026-10-02：过期可放可不放，不放就手动撤）。
+    """
     if not _table_exists(conn, "pin_registry"):
         return []
+    if now is None:
+        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         rows = conn.execute(
-            "SELECT pin_text, weight, created_at FROM pin_registry "
-            "WHERE active=1 ORDER BY id"
+            "SELECT pin_text, weight, created_at, expires_at FROM pin_registry "
+            "WHERE active=1 AND (expires_at IS NULL OR expires_at > ?) "
+            "ORDER BY id",
+            (now,),
         ).fetchall()
     except Exception:
         return []
     return [
         {"pin_text": r[0], "weight": float(r[1]) if r[1] is not None else 1.0,
-         "created_at": r[2]}
+         "created_at": r[2], "expires_at": r[3]}
         for r in rows
     ]
 

@@ -43,14 +43,13 @@ __all__ = [
 #   min_tier_full : 低于此 tier → 'write_degraded'（丢 payload_ref 保信号）
 #                   达到       → 'write_full'（信号+纹理全量落）
 #
-# 【待设计师拍板】以下档位是hui起草的占位默认，语义参照 spec §4 的例子
-# （音频降级 = 只存特征不存波形）。tier 尺度暂定：
-#   0=无授权 1=仅蒸馏信号 2=可存原始样本 3=可参与 DREAM
+# 【设计师拍板 2026-10-02】默认全模态最低档：只留蒸馏信号，原始样本永不落盘。
+# 原话：「最低档授权就够了，不然太占空间了吧？器官毕竟是没有经过真实判断筛选的内容。」
+# 想存原始样本的器官，接入时单独传 policy（把 min_tier_full 设为可达档位）。
+# tier 尺度：0=无授权 1=仅蒸馏信号 2=可存原始样本 3=可参与 DREAM
+# "*" = 全模态兜底：tier0(无授权) 拒写；tier1+ 一律降级；999 不可达 = 永不全量。
 DEFAULT_POLICY = {
-    "text":   {"min_degraded": 0, "min_tier_full": 1},  # 文本/RSS 低敏感
-    "audio":  {"min_degraded": 1, "min_tier_full": 2},  # spec 一号器官=电台耳朵
-    "image":  {"min_degraded": 2, "min_tier_full": 3},  # 摄像头是 9 月学费来源，从严
-    "sensor": {"min_degraded": 2, "min_tier_full": 3},  # 进别人家的传感器，从严
+    "*": {"min_degraded": 1, "min_tier_full": 999},
 }
 
 REQUIRED_FIELDS = ("ts", "organ_id", "modality", "event_type", "payload_summary")

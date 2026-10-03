@@ -124,14 +124,18 @@ def main():
     n = c.execute("SELECT COUNT(*) n FROM context").fetchone()["n"]
     check("S2k 非法值零落行", n == 0, f"rows={n}")
 
-    # ── S3 consent 三级 ──
-    print("── S3 consent 三级各走对 ──")
+    # ── S3 consent 执法（设计师拍板 2026-10-02：默认全模态最低档，原始永不落盘） ──
+    print("── S3 consent 执法：默认最低档 + 显式策略全量 ──")
     d0 = sw.consent_decide(ev(consent_tier=0), None)
     d1 = sw.consent_decide(ev(consent_tier=1), None)
     d2 = sw.consent_decide(ev(consent_tier=2), None)
+    d3 = sw.consent_decide(ev(consent_tier=3), None)
     check("S3a decide默认档 tier0=reject", d0 == "reject", d0)
     check("S3b decide默认档 tier1=write_degraded", d1 == "write_degraded", d1)
-    check("S3c decide默认档 tier2=write_full", d2 == "write_full", d2)
+    check("S3c decide默认档 tier2=write_degraded（拍板：原始样本永不落盘）",
+          d2 == "write_degraded", d2)
+    check("S3c+ decide默认档 tier3=write_degraded（999不可达=永不全量）",
+          d3 == "write_degraded", d3)
 
     # tier0：拒写且零落行
     r0 = sw.ingest(c, ev(consent_tier=0, payload_summary="低授权样本"))
@@ -157,11 +161,20 @@ def main():
           and m1.get("action_taken") == "write_degraded",
           f"type={m1.get('type')} action_taken={m1.get('action_taken')}")
 
-    # tier2：全量——payload_ref 原样保留
-    r2 = sw.ingest(c, ev(consent_tier=2), now="2026-10-01 02:21:00")
-    check("S3k tier2全量回执", r2["ok"] and r2["action"] == "write_full",
+    # tier2（默认策略）：同降级——原始永不落盘是拍板行为，不是漏做
+    r2 = sw.ingest(c, ev(consent_tier=2, payload_summary="默认档tier2样本"),
+                   now="2026-10-01 02:21:00")
+    check("S3k 默认档tier2也降级（永不存原始）", r2["ok"] and r2["action"] == "write_degraded",
           f"action={r2.get('action')}")
-    check("S3l tier2回执带原ref", r2.get("payload_ref") == VALID_REF, str(r2.get("payload_ref")))
+    check("S3l 默认档tier2回执无ref", r2.get("payload_ref") is None, str(r2.get("payload_ref")))
+
+    # 显式策略下全量仍可达（「器官单独点头」路径，设计师拍板预留）
+    r2f = sw.ingest(c, ev(consent_tier=2, payload_summary="显式策略全量样本"),
+                    policy={"audio": {"min_degraded": 1, "min_tier_full": 2}},
+                    now="2026-10-01 02:22:00")
+    check("S3m 显式策略audio tier2=write_full", r2f["ok"] and r2f["action"] == "write_full",
+          f"action={r2f.get('action')}")
+    check("S3n 显式策略回执带原ref", r2f.get("payload_ref") == VALID_REF, str(r2f.get("payload_ref")))
 
     # ── S4 hint 为空可写 ──
     print("── S4 hint 为空可写（入境≠注意）──")
@@ -169,7 +182,7 @@ def main():
     nohint = ev(); del nohint["saliency_hint"]
     r4 = sw.ingest(c, nohint)
     n4 = c.execute("SELECT COUNT(*) n FROM context").fetchone()["n"]
-    check("S4a 无hint全量可写", r4["ok"] and r4["action"] == "write_full"
+    check("S4a 无hint可写（默认档降级落行）", r4["ok"] and r4["action"] == "write_degraded"
           and n4 == n_before + 1,
           f"action={r4.get('action')} rows={n_before}->{n4}")
     row4 = c.execute("SELECT meta FROM context WHERE id=?", (r4["context_id"],)).fetchone()
@@ -181,28 +194,28 @@ def main():
     check("S4c hint=0.0合法且保留", r4b["ok"] and r4b.get("saliency_hint") == 0.0,
           str(r4b.get("saliency_hint")))
 
-    # ── S5 质地面回头路：全量写入后 ref 可从库里取回 ──
-    print("── S5 payload_ref 库内可取回 ──")
-    row2 = c.execute("SELECT * FROM context WHERE id=?", (r2["context_id"],)).fetchone()
+    # ── S5 质地面回头路：显式策略全量写入后 ref 可从库里取回 ──
+    print("── S5 payload_ref 库内可取回（走S3m显式策略样本） ──")
+    row2 = c.execute("SELECT * FROM context WHERE id=?", (r2f["context_id"],)).fetchone()
     m2 = json.loads(row2["meta"])
     check("S5a 全量行meta.payload_ref==原引用", m2.get("payload_ref") == VALID_REF,
           str(m2.get("payload_ref")))
-    check("S5b 行meta带信封字段(ts/organ/modality/event_type)",
-          m2.get("ts") == "2026-10-01T02:14:00Z" and m2.get("organ_id") == "radio-ear-01"
+    check("S5b 行meta带信封字段(ts/organ/modality/event_type)", m2.get("ts") == "2026-10-01T02:14:00Z" and m2.get("organ_id") == "radio-ear-01"
           and m2.get("modality") == "audio" and m2.get("event_type") == "song_detected",
           f"{m2.get('ts')}|{m2.get('organ_id')}|{m2.get('modality')}")
-    check("S5c created_at用server同款格式", row2["created_at"] == "2026-10-01 02:21:00",
+    check("S5c created_at用server同款格式", row2["created_at"] == "2026-10-01 02:22:00",
           row2["created_at"])
 
     # ── S6 孤儿检测 ──
     print("── S6 孤儿检测（引用不可以悬空）──")
     os.makedirs(os.path.join(SAMPLES, "raw", "20261001T0214"), exist_ok=True)
     open(os.path.join(SAMPLES, VALID_REF), "wb").write(b"RIFF-fake-audio")
-    # refA：文件在（全量写入）；refB：悬空（全量写入，文件不存在）
+    # refA：文件在（显式策略全量写入）；refB：悬空（显式策略全量写入，文件不存在）
+    FULL_POLICY = {"audio": {"min_degraded": 1, "min_tier_full": 2}}
     rA = sw.ingest(c, ev(payload_ref=VALID_REF, payload_summary="样本A·文件在"),
-                   now="2026-10-01 03:00:00")
+                   policy=FULL_POLICY, now="2026-10-01 03:00:00")
     rB = sw.ingest(c, ev(payload_ref="raw/20261001T0300/gone.wav", payload_summary="样本B·文件丢"),
-                   now="2026-10-01 03:01:00")
+                   policy=FULL_POLICY, now="2026-10-01 03:01:00")
     orphans = sw.check_orphans(c, SAMPLES)
     orphan_ids = [oid for oid, _ in orphans]
     check("S6a 悬空引用报孤儿", (rB["context_id"], "raw/20261001T0300/gone.wav") in orphans,
