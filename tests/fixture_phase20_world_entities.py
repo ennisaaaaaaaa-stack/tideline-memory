@@ -28,6 +28,7 @@ spec: ~/plans/world-model-w0.md
          attention_stats 缺表优雅降级
      E13 ensure_tables 幂等（跑两遍不炸不重）
      E14 拍板①的对称面：debate/platform/industry/project/watchpost 五型全放行
+     E15 形态滤：jieba:/_unclassified 分词噪声不出提示单（prod首跑暴露）
 
 跑法: /home/ubuntu/.hermes/hermes-agent/venv/bin/python tests/fixture_phase20_world_entities.py
 """
@@ -216,6 +217,43 @@ def main():
         "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('world_entities','world_entities_history','world_knock_log')"
     ).fetchone()[0]
     check("E13 ensure_tables 幂等", n == 3)
+
+    # E15 形态滤：jieba:/_unclassified 噪声不出单（prod首跑暴露）
+    conn9 = fresh_db()
+    conn9.execute(
+        "INSERT INTO attention_stats(cluster_name, hit_count, last_hit) VALUES(?,?,?)",
+        ("jieba:水流 | emb:#26,40,50", 999, "2026-10-05"),
+    )
+    conn9.execute(
+        "INSERT INTO attention_stats(cluster_name, hit_count, last_hit) VALUES(?,?,?)",
+        ("_unclassified", 7137, "2026-10-05"),
+    )
+    conn9.execute(
+        "INSERT INTO attention_stats(cluster_name, hit_count, last_hit) VALUES(?,?,?)",
+        ("emb:#31,39,46", 500, "2026-10-05"),
+    )
+    conn9.execute(
+        "INSERT INTO attention_stats(cluster_name, hit_count, last_hit) VALUES(?,?,?)",
+        ("mochibuttons", 50, "2026-10-04"),
+    )
+    conn9.execute(
+        "INSERT INTO attention_stats(cluster_name, hit_count, last_hit) VALUES(?,?,?)",
+        ("jieba:kannaka | emb:#661,662", 54, "2026-09-30"),
+    )
+    conn9.execute(
+        "INSERT INTO attention_stats(cluster_name, hit_count, last_hit) VALUES(?,?,?)",
+        ("kannaka", 34, "2026-10-05"),
+    )
+    h9 = we.grooming_hints(conn9, top_n=10)
+    by_name = {h["entity"]: h for h in h9}
+    check(
+        "E15 剥壳：jieba:kannaka→kannaka 合并计数，普通词/复合簇号出局",
+        "kannaka" in by_name and by_name["kannaka"]["attention_hits"] == 88
+        and "mochibuttons" in by_name
+        and "水流" not in by_name and "_unclassified" not in by_name
+        and not any(("#" in n or "jieba" in n or " " in n) for n in by_name),
+    )
+    conn9.close()
 
     conn8 = fresh_db()
     ok_all = True

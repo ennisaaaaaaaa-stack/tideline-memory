@@ -291,23 +291,46 @@ def grooming_hints(c: sqlite3.Connection, top_n: int = 10) -> list[dict]:
     """
     hints: dict[str, dict] = {}
 
+    # 形态滤（2026-10-06 prod首跑暴露）：attention_stats 的 cluster_name 是
+    # 「jieba:词 | emb:#簇号」复合键——普通分词（水流/审完）不是实体，但专名
+    # （kannaka/arcy/subagent）恰好也走这个前缀。规则改为「剥壳后验专名形态」：
+    # ①丢 _unclassified ②剥 " | emb:#…" 尾巴 ③剥 jieba: 前缀 ④剩下必须是
+    # 拉丁专名形（^[a-z][a-z0-9._-]{2,}$，全小写连续无空格）——中文普通词
+    # （水流/审完）天然出局，拉丁专名（kannaka）天然入列。中文实体名（zhaozhao）
+    # 检索侧本就不走这条表（topic_clusters 才记中文簇），不误伤。
+    import re as _re
+    _PROPER = _re.compile(r"^[a-z][a-z0-9._-]{2,}$")
+
+    def _pageable(name: str) -> str | None:
+        """返回剥壳后的候选实体名；不可开页返回 None。"""
+        if not name or name.startswith("_"):
+            return None
+        n = name.split("|")[0].strip()      # 剥 emb:# 簇号尾巴
+        if n.startswith("jieba:"):
+            n = n[len("jieba:"):].strip()   # 剥分词前缀
+        if not _PROPER.match(n):
+            return None
+        return n
+
     try:
         rows = c.execute(
             "SELECT cluster_name, hit_count, last_hit FROM attention_stats "
             "ORDER BY hit_count DESC LIMIT ?",
-            (top_n * 5,),
+            (top_n * 20,),
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []  # 表不存在=检索侧零信号，不是错误
     for r in rows:
-        name = r[0]
+        name = _pageable(r[0])
+        if name is None:
+            continue
         has = c.execute(
             "SELECT 1 FROM world_entities WHERE entity=?", (name,)
         ).fetchone()
         if has:
             continue
         hints.setdefault(name, {"entity": name, "attention_hits": 0, "knocks": 0})
-        hints[name]["attention_hits"] = r[1]
+        hints[name]["attention_hits"] += r[1]
         hints[name]["last_seen"] = r[2]
 
     for r in c.execute(
