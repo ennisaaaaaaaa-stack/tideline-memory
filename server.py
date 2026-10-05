@@ -26,6 +26,12 @@ try:
 except ImportError:
     sensory_write = None   # 单文件部署缺模块时 server 仍可跑（工具注册仍展示但调用时报缺）
     salience_read = None
+try:
+    import world_entities   # v2.12 世界模型（Phase 20 / W1, 2026-10-06）
+    import importlib
+    importlib.reload(world_entities)  # dev 便利：gateway 常驻时拿最新实现
+except ImportError:
+    world_entities = None
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -1561,6 +1567,75 @@ async def list_tools() -> list[types.Tool]:
         },
     ),
 
+    # ── v2.12 (2026-10-06): 世界模型 world_entities（Phase 20 / W1）──
+    # 她的四枚拍板全部住在 world_entities.py 的注释与执法里：
+    # ①人不进世界模型（归profiles）②值得才开页+只在梳理窗写（日常只knock）
+    # ③stance必须手写 ④工作日投递窗。
+    types.Tool(
+        name="world_write_stance",
+        description=(
+            "🌍 世界模型：开页/改页（唯一写 stance 的入口，只在梳理窗亲手调用）。"
+            "人不进世界模型——不管人还是机，全归 memory_write_profile（她 2026-10-06 拍板）。"
+            "etype 只收 debate/platform/industry/project/watchpost。"
+            "每个立场自带对手盘：allies/counters。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": "实体名（论战/平台/行业/项目/观察位）"},
+                "etype": {"type": "string", "enum": ["debate", "platform", "industry", "project", "watchpost"]},
+                "stance": {"type": "string", "description": "我的立场句——必须手写，空串拒绝"},
+                "allies": {"type": "array", "items": {"type": "string"}, "description": "盟友锚点（人名可作锚点）"},
+                "counters": {"type": "array", "items": {"type": "string"}, "description": "对手盘锚点"},
+                "evidence_narrative_ids": {"type": "array", "items": {"type": "integer"}, "description": "证据挂的 narrative id"},
+                "deliver_window": {"type": "string", "enum": ["always", "weekday"], "description": "投递窗：weekday=工作日以外不进她视野（行业项目类）"},
+            },
+            "required": ["entity", "etype", "stance"],
+        },
+    ),
+
+    types.Tool(
+        name="world_read",
+        description="🌍 世界模型：读立场页。单实体/按类型/整表。",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": "实体名（可选，不给=整表）"},
+                "etype": {"type": "string", "description": "类型过滤（可选）"},
+            },
+        },
+    ),
+
+    types.Tool(
+        name="world_knock",
+        description=(
+            "🌍 世界模型：器官事件敲门（日常唯一写路径）。已开页=knock_count+1；"
+            "未开页=只记流水不建页——开页等梳理窗。永不自动改 stance。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": "被敲门的实体名"},
+                "source": {"type": "string", "description": "敲门来源（organ_id/平台名）"},
+            },
+            "required": ["entity"],
+        },
+    ),
+
+    types.Tool(
+        name="world_grooming_hints",
+        description=(
+            "🌍 世界模型：梳理窗提示单——被照亮（attention_stats）+被敲门（world_knock_log）"
+            "最多但还没开页的名字。开不开页永远是hui的手写判断，此单只提示不建页。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "top_n": {"type": "integer", "default": 10},
+            },
+        },
+    ),
+
     ]
 
 
@@ -2456,6 +2531,54 @@ async def _dispatch(name, a, c):
         for r in rows:
             lines.append(_fmt_context(r))
         return [types.TextContent(type="text", text="\n\n".join(lines))]
+
+    # ── v2.12 世界模型 world_entities（Phase 20 / W1, 2026-10-06）──
+    # 四枚拍板的执法都在 world_entities.py：①人不进（PersonRejected）
+    # ②值得才开页+日常只knock ③stance必须手写（空串拒绝）④工作日投递窗。
+    if name == "world_write_stance":
+        if world_entities is None:
+            return [types.TextContent(type="text", text="❌ world_entities 模块未加载（单文件部署）。")]
+        world_entities.ensure_tables(c)
+        try:
+            page = world_entities.write_stance(
+                c,
+                entity=a["entity"], etype=a["etype"], stance=a["stance"],
+                allies=a.get("allies", []), counters=a.get("counters", []),
+                evidence_narrative_ids=a.get("evidence_narrative_ids", []),
+                deliver_window=a.get("deliver_window", "always"),
+            )
+            return [types.TextContent(type="text", text="🌍 立场页已写（梳理窗手写）:\n" + json.dumps(page, ensure_ascii=False, indent=2))]
+        except world_entities.PersonRejected as e:
+            return [types.TextContent(type="text", text=f"🚫 拍板①执法: {e}")]
+
+    if name == "world_read":
+        if world_entities is None:
+            return [types.TextContent(type="text", text="❌ world_entities 模块未加载（单文件部署）。")]
+        world_entities.ensure_tables(c)
+        pages = world_entities.read_entities(c, entity=a.get("entity"), etype=a.get("etype"))
+        if not pages:
+            return [types.TextContent(type="text", text="🌍 还没有立场页。梳理窗里用 world_write_stance 开第一页。")]
+        return [types.TextContent(type="text", text="🌍 世界模型立场页:\n" + json.dumps(pages, ensure_ascii=False, indent=2))]
+
+    if name == "world_knock":
+        if world_entities is None:
+            return [types.TextContent(type="text", text="❌ world_entities 模块未加载（单文件部署）。")]
+        world_entities.ensure_tables(c)
+        r = world_entities.knock(c, entity=a["entity"], source=a.get("source"))
+        side = "已开页，knock+1" if r["page_existed"] else "未开页，只记流水——开页等梳理窗"
+        return [types.TextContent(type="text", text=f"🌍 敲门: {r['entity']}（{side}，knock_count={r['knock_count']}）")]
+
+    if name == "world_grooming_hints":
+        if world_entities is None:
+            return [types.TextContent(type="text", text="❌ world_entities 模块未加载（单文件部署）。")]
+        world_entities.ensure_tables(c)
+        hints = world_entities.grooming_hints(c, top_n=a.get("top_n", 10))
+        if not hints:
+            return [types.TextContent(type="text", text="🌍 梳理提示单为空：没有高频未开页的名字。")]
+        lines = ["🌍 梳理窗提示单（开不开页是你的手写判断，此单只提示）:\n"]
+        for h in hints:
+            lines.append(f"   {h['entity']} — attention={h['attention_hits']} knocks={h['knocks']}")
+        return [types.TextContent(type="text", text="\n".join(lines))]
 
     return [types.TextContent(type="text", text=f"❓ 未知工具: {name}")]
 
